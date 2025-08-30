@@ -1,0 +1,20 @@
+name: Sync fork with upstream
+
+on:
+  schedule:
+    - cron: "0 9 * * *"   # daily at 09:00 UTC (~2am PT in summer)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # allow pushing to your fork
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync default branch from upstream
+        env:
+          GH_TOKEN: ${{ github.token }}   # built-in; no secret needed for public repos
+        run: |
+          # Change --branch if your default branch isn't 'main'
+          gh repo sync "${GITHUB_REPOSITORY}" --branch main
