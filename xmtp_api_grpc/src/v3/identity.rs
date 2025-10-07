@@ -1,19 +1,21 @@
-use crate::Client;
+use crate::error::GrpcError;
+use crate::v3::Client;
 use xmtp_proto::{
+    ApiEndpoint,
+    api::ApiClientError,
     api_client::{IdentityStats, XmtpIdentityClient},
-    traits::ApiClientError,
     xmtp::identity::api::v1::{
         GetIdentityUpdatesRequest as GetIdentityUpdatesV2Request,
         GetIdentityUpdatesResponse as GetIdentityUpdatesV2Response, GetInboxIdsRequest,
         GetInboxIdsResponse, PublishIdentityUpdateRequest, PublishIdentityUpdateResponse,
         VerifySmartContractWalletSignaturesRequest, VerifySmartContractWalletSignaturesResponse,
     },
-    ApiEndpoint,
 };
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl XmtpIdentityClient for Client {
-    type Error = ApiClientError<crate::GrpcError>;
+    type Error = ApiClientError<GrpcError>;
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn publish_identity_update(
