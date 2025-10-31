@@ -4,6 +4,7 @@ use prost::Message;
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::{broadcast, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
+use xmtp_api_d14n::protocol::{Extractor, ProtocolEnvelope as _};
 
 use tracing::instrument;
 use xmtp_db::prelude::*;
@@ -53,7 +54,7 @@ impl RetryableError for LocalEventError {
 
 /// Events local to this client
 /// are broadcast across all senders/receivers of streams
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LocalEvents {
     // a new group was created
     NewGroup(Vec<u8>),
@@ -189,6 +190,12 @@ pub enum SubscribeError {
     BoxError(Box<dyn RetryableError + Send + Sync>),
     #[error(transparent)]
     Db(#[from] xmtp_db::ConnectionError),
+    #[error(transparent)]
+    Conversion(#[from] xmtp_proto::ConversionError),
+    #[error(transparent)]
+    Envelope(#[from] xmtp_api_d14n::protocol::EnvelopeError),
+    #[error("the originators of the messages do not match expected: {expected}, got: {got}")]
+    MismatchedOriginators { expected: u32, got: u32 },
 }
 
 impl From<GroupError> for SubscribeError {
@@ -218,6 +225,10 @@ impl RetryableError for SubscribeError {
             ApiClient(e) => retryable!(e),
             BoxError(e) => retryable!(e),
             Db(c) => retryable!(c),
+            Conversion(c) => retryable!(c),
+            Envelope(c) => retryable!(c),
+            // this is an error which should never occur
+            MismatchedOriginators { .. } => false,
         }
     }
 }
@@ -236,11 +247,15 @@ where
         let conn = self.context.db();
         let envelope =
             WelcomeMessage::decode(envelope_bytes.as_slice()).map_err(SubscribeError::from)?;
-        let known_welcomes = HashSet::from_iter(conn.group_welcome_ids()?.into_iter());
+        let known_welcomes = HashSet::from_iter(conn.group_cursors()?.into_iter());
+        let mut extractor = xmtp_api_d14n::protocol::V3WelcomeMessageExtractor::default();
+        envelope.accept(&mut extractor)?;
+        let welcome: xmtp_proto::types::WelcomeMessage = extractor.get()?;
+
         let future = ProcessWelcomeFuture::new(
             known_welcomes,
             self.context.clone(),
-            WelcomeOrGroup::Welcome(envelope),
+            WelcomeOrGroup::Welcome(welcome),
             None,
             false,
             None,

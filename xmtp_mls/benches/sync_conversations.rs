@@ -22,6 +22,7 @@ use tracing::{Instrument, trace_span};
 use xmtp_common::bench::{self, BENCH_ROOT_SPAN, bench_async_setup};
 use xmtp_content_types::test_utils::TestContentGenerator;
 use xmtp_mls::groups::MlsGroup;
+use xmtp_mls::groups::send_message_opts::SendMessageOpts;
 use xmtp_mls::utils::TestXmtpMlsContext;
 use xmtp_mls::utils::bench::{BenchClient, new_client};
 
@@ -101,7 +102,7 @@ async fn setup_sync_conversations_bench(
         .await
         .unwrap();
     assert!(
-        synced_groups > 0,
+        synced_groups.num_eligible > 0,
         "Other client should have received the group"
     );
 
@@ -127,7 +128,7 @@ async fn setup_sync_conversations_bench(
             TestContentGenerator::text_content(&format!("Sync message {} from other", i));
 
         other_group
-            .send_message(&content1.encode_to_vec())
+            .send_message(&content1.encode_to_vec(), SendMessageOpts::default())
             .await
             .unwrap();
         message_bar.inc(1);

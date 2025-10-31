@@ -1,14 +1,11 @@
 use super::*;
+use crate::groups::send_message_opts::SendMessageOpts;
 
 #[cfg(target_arch = "wasm32")]
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-use crate::utils::ClientTester;
+use crate::tester;
 use crate::{assert_msg, builder::ClientBuilder};
-use crate::{
-    tester,
-    utils::fixtures::{bo, eve},
-};
 use futures::StreamExt;
 use rstest::*;
 use std::sync::Arc;
@@ -22,10 +19,10 @@ use xmtp_id::associations::test_utils::WalletTestExt;
 #[timeout(Duration::from_secs(15))]
 #[cfg_attr(target_arch = "wasm32", ignore)]
 async fn test_stream_all_messages_changing_group_list() {
-    let alix = ClientBuilder::new_test_client(&generate_local_wallet()).await;
-    let bo = ClientBuilder::new_test_client(&generate_local_wallet()).await;
+    let alix = ClientBuilder::new_test_client_vanilla(&generate_local_wallet()).await;
+    let bo = ClientBuilder::new_test_client_vanilla(&generate_local_wallet()).await;
     let caro_wallet = generate_local_wallet();
-    let caro = ClientBuilder::new_test_client(&caro_wallet).await;
+    let caro = ClientBuilder::new_test_client_vanilla(&caro_wallet).await;
 
     let alix_group = alix.create_group(None, None).unwrap();
     tracing::info!("Created alix group {}", hex::encode(&alix_group.group_id));
@@ -37,17 +34,26 @@ async fn test_stream_all_messages_changing_group_list() {
     let stream = caro.stream_all_messages(None, None).await.unwrap();
     futures::pin_mut!(stream);
 
-    alix_group.send_message(b"first").await.unwrap();
+    alix_group
+        .send_message(b"first", SendMessageOpts::default())
+        .await
+        .unwrap();
     assert_msg!(stream, "first");
     let bo_group = bo
         .find_or_create_dm(caro_wallet.identifier(), None)
         .await
         .unwrap();
 
-    bo_group.send_message(b"second").await.unwrap();
+    bo_group
+        .send_message(b"second", SendMessageOpts::default())
+        .await
+        .unwrap();
     assert_msg!(stream, "second");
 
-    alix_group.send_message(b"third").await.unwrap();
+    alix_group
+        .send_message(b"third", SendMessageOpts::default())
+        .await
+        .unwrap();
     assert_msg!(stream, "third");
 
     let alix_group_2 = alix.create_group(None, None).unwrap();
@@ -56,10 +62,16 @@ async fn test_stream_all_messages_changing_group_list() {
         .await
         .unwrap();
 
-    alix_group.send_message(b"fourth").await.unwrap();
+    alix_group
+        .send_message(b"fourth", SendMessageOpts::default())
+        .await
+        .unwrap();
     assert_msg!(stream, "fourth");
 
-    alix_group_2.send_message(b"fifth").await.unwrap();
+    alix_group_2
+        .send_message(b"fifth", SendMessageOpts::default())
+        .await
+        .unwrap();
     assert_msg!(stream, "fifth");
 }
 
@@ -85,24 +97,36 @@ async fn test_stream_all_messages_unchanging_group_list() {
 
     let stream = caro.stream_all_messages(None, None).await.unwrap();
     futures::pin_mut!(stream);
-    bo_group.send_message(b"first").await.unwrap();
+    bo_group
+        .send_message(b"first", SendMessageOpts::default())
+        .await
+        .unwrap();
     assert_msg!(stream, "first");
 
-    bo_group.send_message(b"second").await.unwrap();
+    bo_group
+        .send_message(b"second", SendMessageOpts::default())
+        .await
+        .unwrap();
     assert_msg!(stream, "second");
 
-    alix_group.send_message(b"third").await.unwrap();
+    alix_group
+        .send_message(b"third", SendMessageOpts::default())
+        .await
+        .unwrap();
     assert_msg!(stream, "third");
 
-    bo_group.send_message(b"fourth").await.unwrap();
+    bo_group
+        .send_message(b"fourth", SendMessageOpts::default())
+        .await
+        .unwrap();
     assert_msg!(stream, "fourth");
 }
 
 #[rstest::rstest]
 #[xmtp_common::test]
 async fn test_dm_stream_all_messages() {
-    let alix = ClientBuilder::new_test_client(&generate_local_wallet()).await;
-    let bo = ClientBuilder::new_test_client(&generate_local_wallet()).await;
+    tester!(alix, with_name: "alix");
+    tester!(bo, with_name: "bo");
 
     let alix_group = alix.create_group(None, None).unwrap();
     alix_group
@@ -114,11 +138,6 @@ async fn test_dm_stream_all_messages() {
         .find_or_create_dm_by_inbox_id(bo.inbox_id(), None)
         .await
         .unwrap();
-    // TODO: This test does not work on web
-    // unless these streams are in their own scope.
-    // there's probably an issue with the old stream
-    // not being dropped before the new stream starts.
-    // Could be fixed by sending an abort signal to the JS stream.
     {
         // start a stream with only group messages
         let stream = bo
@@ -127,15 +146,16 @@ async fn test_dm_stream_all_messages() {
             .unwrap();
         futures::pin_mut!(stream);
         alix_dm
-            .send_message("first DM msg".as_bytes())
+            .send_message("first DM msg".as_bytes(), SendMessageOpts::default())
             .await
             .unwrap();
         alix_group
-            .send_message("second GROUP msg".as_bytes())
+            .send_message("first GROUP msg".as_bytes(), SendMessageOpts::default())
             .await
             .unwrap();
-        assert_msg!(stream, "second GROUP msg");
+        assert_msg!(stream, "first GROUP msg");
     }
+    bo.sync_all_welcomes_and_groups(None).await.unwrap();
     {
         // Start a stream with only dms
         let stream = bo
@@ -144,23 +164,37 @@ async fn test_dm_stream_all_messages() {
             .unwrap();
         futures::pin_mut!(stream);
         alix_group
-            .send_message("second GROUP msg".as_bytes())
+            .send_message("second GROUP msg".as_bytes(), SendMessageOpts::default())
             .await
             .unwrap();
         alix_dm
-            .send_message("second DM msg".as_bytes())
+            .send_message("second DM msg".as_bytes(), SendMessageOpts::default())
             .await
             .unwrap();
         assert_msg!(stream, "second DM msg");
     }
+    bo.sync_all_welcomes_and_groups(None).await.unwrap();
     // Start a stream with all conversations
     // Wait for 2 seconds for the group creation to be streamed
     let stream = bo.stream_all_messages(None, None).await.unwrap();
     futures::pin_mut!(stream);
-    alix_group.send_message("first".as_bytes()).await.unwrap();
+    alix_group
+        .send_message("first".as_bytes(), SendMessageOpts::default())
+        .await
+        .unwrap();
+    // TODO:d14n
+    // this discrepency is because of the LCC (we get duplicates)
+    // not sure if theres an easy fix
+    // https://github.com/xmtp/libxmtp/issues/2613
+    if cfg!(feature = "d14n") {
+        assert_msg!(stream, "second DM msg");
+    }
     assert_msg!(stream, "first");
 
-    alix_dm.send_message("second".as_bytes()).await.unwrap();
+    alix_dm
+        .send_message("second".as_bytes(), SendMessageOpts::default())
+        .await
+        .unwrap();
     assert_msg!(stream, "second");
 }
 
@@ -203,7 +237,7 @@ async fn test_stream_all_messages_does_not_lose_messages() {
         for i in 0..15 {
             let msg = format!("main spam {i}");
             alix_group_pointer
-                .send_message(msg.as_bytes())
+                .send_message(msg.as_bytes(), SendMessageOpts::default())
                 .await
                 .unwrap();
             xmtp_common::time::sleep(Duration::from_micros(100)).await;
@@ -220,7 +254,10 @@ async fn test_stream_all_messages_does_not_lose_messages() {
             let new_group = eve.create_group(None, None).unwrap();
             new_group.add_members_by_inbox_id(&[caro]).await.unwrap();
             let msg = format!("EVE spam {i} from new group");
-            new_group.send_message(msg.as_bytes()).await.unwrap();
+            new_group
+                .send_message(msg.as_bytes(), SendMessageOpts::default())
+                .await
+                .unwrap();
         }
     });
 
@@ -230,7 +267,7 @@ async fn test_stream_all_messages_does_not_lose_messages() {
         let bo_group = &bo_group;
         for i in 0..15 {
             bo_group
-                .send_message(format!("bo msg {i}").as_bytes())
+                .send_message(format!("bo msg {i}").as_bytes(), SendMessageOpts::default())
                 .await
                 .unwrap();
             xmtp_common::time::sleep(Duration::from_millis(50)).await
@@ -289,7 +326,7 @@ async fn test_stream_all_messages_detached_group_changes() {
                 hex::encode(&new_group.group_id)
             );
             new_group
-                .send_message(b"spam from new group")
+                .send_message(b"spam from new group", SendMessageOpts::default())
                 .await
                 .unwrap();
         }
@@ -333,8 +370,8 @@ async fn test_stream_all_messages_filters_by_consent_state(
     #[case] filter: ConsentState,
     #[case] expected_message: &str,
 ) {
-    let sender = ClientBuilder::new_test_client(&generate_local_wallet()).await;
-    let receiver = ClientBuilder::new_test_client(&generate_local_wallet()).await;
+    tester!(sender, with_name: "sender");
+    tester!(receiver, with_name: "receiver");
 
     // Create group with Allowed consent
     let allowed_group = sender.create_group(None, None).unwrap();
@@ -371,17 +408,21 @@ async fn test_stream_all_messages_filters_by_consent_state(
         .await
         .unwrap();
     futures::pin_mut!(stream);
-
+    //  if cfg!(feature = "d14n") {
+    //      // group updated codec b/c group hasn't written to db so lcc is 0
+    //      use futures_test::assert_stream_next;
+    //      let _ = stream.next().await.unwrap();
+    //  }
     allowed_group
-        .send_message("msg in allowed".as_bytes())
+        .send_message("msg in allowed".as_bytes(), SendMessageOpts::default())
         .await
         .unwrap();
     denied_group
-        .send_message("msg in denied".as_bytes())
+        .send_message("msg in denied".as_bytes(), SendMessageOpts::default())
         .await
         .unwrap();
     unknown_group
-        .send_message("msg in unknown".as_bytes())
+        .send_message("msg in unknown".as_bytes(), SendMessageOpts::default())
         .await
         .unwrap();
 
@@ -390,44 +431,49 @@ async fn test_stream_all_messages_filters_by_consent_state(
 
 #[rstest]
 #[xmtp_common::test]
-#[awt]
-async fn stream_messages_keeps_track_of_cursor(
-    #[future] bo: ClientTester,
-    #[future] eve: ClientTester,
-) {
-    tester!(alice);
-    let group = alice.create_group(None, None).unwrap();
+async fn stream_messages_keeps_track_of_cursor() {
+    tester!(bo, with_name: "bo");
+    tester!(eve, with_name: "eve");
+    tester!(alice, with_name: "alice");
+    let alice_group = alice.create_group(None, None).unwrap();
 
-    group
+    alice_group
         .add_members_by_inbox_id(&[bo.inbox_id(), eve.inbox_id()])
         .await
         .unwrap();
     let _bo_groups = bo.sync_welcomes().await.unwrap();
     let eve_groups = eve.sync_welcomes().await.unwrap();
     let eve_group = eve_groups.first().unwrap();
-    group.sync().await.unwrap();
+    alice_group.sync().await.unwrap();
     // get the group epoch to 28
     for _ in 0..7 {
-        group
+        alice_group
             .update_group_name(format!("test name {}", xmtp_common::rand_string::<5>()))
             .await
             .unwrap();
     }
     for _ in 0..25 {
         eve_group
-            .send_message(format!("message {}", xmtp_common::rand_string::<5>()).as_bytes())
+            .send_message(
+                format!("message {}", xmtp_common::rand_string::<5>()).as_bytes(),
+                SendMessageOpts::default(),
+            )
             .await
             .unwrap();
     }
     // get the group epoch to 28
     for _ in 0..7 {
-        group
+        alice_group
             .update_group_name(format!("test name {}", xmtp_common::rand_string::<5>()))
             .await
             .unwrap();
     }
-    group.sync().await.unwrap();
-    // create a new installation for alice
+    alice_group.sync().await.unwrap();
+
+    /////////////////////////////////// New installation \\\\\\\\\\\\\\\\\\\\\\\\\
+    //                   create new installation for alice                      \\
+    /////////////////////////////////////////////////////\\\\\\\\\\\\\\\\\\\\\\\\\
+
     tester!(alice_2, from: alice);
 
     let mut s = StreamAllMessages::new(&alice_2.context, None, None)
@@ -435,7 +481,7 @@ async fn stream_messages_keeps_track_of_cursor(
         .unwrap();
     // elapse enough time to update installations
     xmtp_common::time::sleep(std::time::Duration::from_secs(2)).await;
-    group.update_installations().await.unwrap();
+    alice_group.update_installations().await.unwrap();
     // if the stream behaved as expected, it should have set the cursor to the latest
     // in the group before any messages that could actually be decrypted by alices
     // second installation were sent.
@@ -444,14 +490,8 @@ async fn stream_messages_keeps_track_of_cursor(
     let result = xmtp_common::time::timeout(std::time::Duration::from_secs(1), s.next()).await;
     assert!(matches!(result.unwrap_err(), xmtp_common::time::Expired));
 
-    {
-        let msg_stream = &s.messages;
-        let cursor = msg_stream.position(group.group_id.as_slice()).unwrap();
-        assert!(cursor.last_streamed() > 1);
-    }
-
     eve_group
-        .send_message(b"decryptable message")
+        .send_message(b"decryptable message", SendMessageOpts::default())
         .await
         .unwrap();
     assert_msg!(s, "decryptable message");
@@ -479,7 +519,10 @@ async fn test_stream_all_messages_filters_conversations_created_after_init() {
         .await
         .unwrap();
 
-    new_group.send_message(b"new message").await.unwrap();
+    new_group
+        .send_message(b"new message", SendMessageOpts::default())
+        .await
+        .unwrap();
     // Verify that no unknown message was received
     let result = xmtp_common::time::timeout(Duration::from_secs(2), stream.next()).await;
     assert!(
@@ -513,7 +556,9 @@ async fn test_stream_all_messages_filters_new_group_when_dm_only() {
     futures::pin_mut!(stream);
 
     // Send message in DM - should appear in stream
-    dm.send_message("msg in dm".as_bytes()).await.unwrap();
+    dm.send_message("msg in dm".as_bytes(), SendMessageOpts::default())
+        .await
+        .unwrap();
     assert_msg!(stream, "msg in dm");
 
     // Create new group that will arrive via conversation stream
@@ -525,7 +570,7 @@ async fn test_stream_all_messages_filters_new_group_when_dm_only() {
 
     // Send message in group - should NOT appear in stream
     new_group
-        .send_message("msg in group".as_bytes())
+        .send_message("msg in group".as_bytes(), SendMessageOpts::default())
         .await
         .unwrap();
 
