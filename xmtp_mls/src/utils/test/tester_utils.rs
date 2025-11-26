@@ -17,7 +17,6 @@ use crate::{
     worker::metrics::WorkerMetrics,
 };
 use alloy::signers::local::PrivateKeySigner;
-use async_trait::async_trait;
 use diesel::QueryableByName;
 use futures::Stream;
 use futures_executor::block_on;
@@ -115,7 +114,7 @@ where
 
     pub fn save_db_snapshot_to_file(&self, path: impl AsRef<Path>) {
         let snapshot = self.db_snapshot();
-        std::fs::write(path, &snapshot);
+        std::fs::write(path, &snapshot).unwrap();
     }
 }
 
@@ -125,16 +124,14 @@ struct TableName {
     name: String,
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[xmtp_common::async_trait]
 pub trait LocalTester {
     async fn new() -> Self;
     async fn new_passkey() -> Tester<PasskeyUser, FullXmtpClient>;
     fn builder() -> TesterBuilder<PrivateKeySigner>;
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[xmtp_common::async_trait]
 impl LocalTester for Tester<PrivateKeySigner, FullXmtpClient> {
     async fn new() -> Self {
         let wallet = generate_local_wallet();
@@ -183,7 +180,8 @@ where
         if self.ephemeral_db || self.snapshot.is_some() {
             let db = if let Some(snapshot) = &self.snapshot {
                 client.allow_offline = true;
-                TestDb::create_ephemeral_store_from_snapshot(snapshot).await
+                TestDb::create_ephemeral_store_from_snapshot(snapshot, self.snapshot_path.as_ref())
+                    .await
             } else {
                 TestDb::create_ephemeral_store().await
             };
@@ -371,6 +369,7 @@ where
     pub triggers: bool,
     pub external_identity: Option<Identity>,
     pub snapshot: Option<Arc<Vec<u8>>>,
+    pub snapshot_path: Option<PathBuf>,
     /// whether this builder represents a second installation
     pub installation: bool,
     pub disable_workers: bool,
@@ -404,11 +403,12 @@ impl Default for TesterBuilder<PrivateKeySigner> {
             commit_log_worker: true, // Default to enabled to match production
             installation: false,
             in_memory_cursors: false,
-            ephemeral_db: false,
+            ephemeral_db: true,
             triggers: false,
             api_endpoint: ApiEndpoint::Local,
             external_identity: None,
             snapshot: None,
+            snapshot_path: None,
             disable_workers: false,
         }
     }
@@ -441,6 +441,7 @@ where
             triggers: self.triggers,
             external_identity: self.external_identity,
             snapshot: self.snapshot,
+            snapshot_path: self.snapshot_path,
             disable_workers: self.disable_workers,
         }
     }
@@ -491,11 +492,14 @@ where
 
     pub fn snapshot(mut self, snapshot: Arc<Vec<u8>>) -> Self {
         self.snapshot = Some(snapshot);
-        self.ephemeral_db()
+        self.ephemeral_db = true;
+        self
     }
 
     pub fn snapshot_file(mut self, snapshot_path: impl Into<PathBuf>) -> Self {
-        let snapshot = std::fs::read(snapshot_path.into()).unwrap();
+        let snapshot_path = snapshot_path.into();
+        let snapshot = std::fs::read(&snapshot_path).unwrap();
+        self.snapshot_path = Some(snapshot_path);
         self.snapshot(Arc::new(snapshot))
     }
 
@@ -569,8 +573,8 @@ where
         self
     }
 
-    pub fn ephemeral_db(mut self) -> Self {
-        self.ephemeral_db = true;
+    pub fn persistent_db(mut self) -> Self {
+        self.ephemeral_db = false;
         self
     }
 
@@ -791,7 +795,7 @@ mod tests {
 
     #[xmtp_common::test(unwrap_try = true)]
     async fn test_snapshots() {
-        tester!(alix, ephemeral_db);
+        tester!(alix);
         let g = alix.create_group(None, None)?;
         let snap = Arc::new(alix.db_snapshot());
         tester!(alix2, snapshot: snap);
