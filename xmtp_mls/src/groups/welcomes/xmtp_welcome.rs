@@ -15,7 +15,6 @@ use crate::{
     },
     intents::ProcessIntentError,
     subscriptions::SyncWorkerEvent,
-    track,
 };
 use derive_builder::Builder;
 use openmls::group::MlsGroup as OpenMlsGroup;
@@ -72,7 +71,7 @@ impl<'a, C, V> XmtpWelcome<'a, C, V> {
 }
 
 /// result of a commit
-/// we consider a commit succesful if it either:
+/// we consider a commit successful if it either:
 /// - Fails forever (can not be retried)
 /// - Was successfully decrypted and processed
 enum CommitResult<C> {
@@ -241,7 +240,7 @@ where
     }
 
     /// Commit the welcome to the local db and memory.
-    /// Verifies the welcome processed succesfully. If it fails on a non-retryable error,
+    /// Verifies the welcome processed successfully. If it fails on a non-retryable error,
     /// increments the cursor. Otherwise state must remain as if no transaction occurred.
     /// Returns an error if group failed to commit.
     /// Once transaction succeeds, sends device sync messages
@@ -277,7 +276,7 @@ where
     }
 
     /// The welcome was validated and we haven't processed yet.
-    /// Can be commited
+    /// Can be committed
     /// Requires a transaction
     fn commit(
         &self,
@@ -466,15 +465,6 @@ where
         let stored_group = db.insert_or_replace_group(to_store)?;
 
         StoredConsentRecord::stitch_dm_consent(&db, &stored_group)?;
-        track!(
-            &self.context,
-            "Group Welcome",
-            {
-                "conversation_type": stored_group.conversation_type,
-                "added_by_inbox_id": &stored_group.added_by_inbox_id
-            },
-            group: &stored_group.id
-        );
 
         // Create a GroupUpdated payload
         let current_inbox_id = context.inbox_id().to_string();

@@ -15,7 +15,6 @@ pub mod consent_record;
 pub mod conversation_list;
 pub mod database;
 pub mod db_connection;
-pub mod events;
 pub mod group;
 pub mod group_intent;
 pub mod group_message;
@@ -275,7 +274,7 @@ pub trait XmtpDb: MaybeSend + MaybeSync {
         Ok(())
     }
 
-    /// The Options this databae was created with
+    /// The Options this database was created with
     fn opts(&self) -> &StorageOption;
 
     /// Validate a connection is as expected
