@@ -3,10 +3,11 @@ use xmtp_db::group_message::ContentType as XmtpContentType;
 
 pub mod actions;
 pub mod attachment;
-pub mod decoded_message_body;
+pub mod decoded_message_content;
 pub mod group_updated;
 pub mod intent;
 pub mod leave_request;
+pub mod markdown;
 pub mod multi_remote_attachment;
 pub mod reaction;
 pub mod read_receipt;
@@ -20,6 +21,7 @@ pub mod wallet_send_calls;
 pub enum ContentType {
   Unknown,
   Text,
+  Markdown,
   LeaveRequest,
   GroupMembershipChange,
   GroupUpdated,
@@ -36,6 +38,7 @@ impl From<ContentType> for XmtpContentType {
     match value {
       ContentType::Unknown => XmtpContentType::Unknown,
       ContentType::Text => XmtpContentType::Text,
+      ContentType::Markdown => XmtpContentType::Markdown,
       ContentType::LeaveRequest => XmtpContentType::LeaveRequest,
       ContentType::GroupMembershipChange => XmtpContentType::GroupMembershipChange,
       ContentType::GroupUpdated => XmtpContentType::GroupUpdated,
