@@ -3,6 +3,7 @@ name = "xmtp_archive"
 edition = "2024"
 license.workspace = true
 version.workspace = true
+description = "archive and backup features for xmtp"
 
 [lints]
 workspace = true
@@ -17,7 +18,7 @@ async-trait.workspace = true
 futures = { workspace = true, features = ["alloc", "std"] }
 futures-util.workspace = true
 openmls.workspace = true
-pin-project-lite.workspace = true
+pin-project.workspace = true
 prost.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 serde_json.workspace = true
@@ -26,6 +27,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+xmtp-workspace-hack = { version = "0.1", path = "../xmtp-workspace-hack" }
 xmtp_common.workspace = true
 xmtp_db.workspace = true
 xmtp_mls_common.workspace = true

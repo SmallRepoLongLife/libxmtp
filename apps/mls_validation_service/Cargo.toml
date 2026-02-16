@@ -4,13 +4,14 @@ edition = "2024"
 name = "mls_validation_service"
 version.workspace = true
 license.workspace = true
+description = "backend validation service for XMTP"
 
 [[bin]] # Bin to run the Validation Service
 name = "mls-validation-service"
 path = "src/main.rs"
 
 [build-dependencies]
-vergen-git2 = { workspace = true, features = ["build"] }
+vergen-gix = { workspace = true, features = ["build"] }
 
 [dependencies]
 alloy.workspace = true
@@ -27,6 +28,7 @@ tonic = { workspace = true }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "ansi"] }
 warp = "0.3.6"
+xmtp-workspace-hack = { version = "0.1", path = "../../crates/xmtp-workspace-hack" }
 xmtp_common.workspace = true
 xmtp_configuration.workspace = true
 xmtp_cryptography.workspace = true

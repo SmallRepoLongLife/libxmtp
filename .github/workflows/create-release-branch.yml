@@ -1,0 +1,104 @@
+# .github/workflows/create-release-branch.yml
+name: Create Release Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      base-ref:
+        description: "Base ref (commit/branch) to create the release from"
+        required: false
+        type: string
+      version:
+        description: "Release version number (e.g. 1.8.0)"
+        required: true
+        type: string
+      ios-bump:
+        description: "iOS SDK version bump"
+        required: false
+        type: choice
+        options:
+          - "none"
+          - "patch"
+          - "minor"
+          - "major"
+        default: "none"
+      android-bump:
+        description: "Android SDK version bump"
+        required: false
+        type: choice
+        options:
+          - "none"
+          - "patch"
+          - "minor"
+          - "major"
+        default: "none"
+      node:
+        description: "Include Node bindings in release"
+        required: false
+        type: boolean
+        default: false
+      wasm:
+        description: "Include WASM bindings in release"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  create-branch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.base-ref || github.ref_name }}
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-release-tools
+      - name: Create release branch
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          BASE_REF: ${{ inputs.base-ref || github.ref_name }}
+          IOS_BUMP: ${{ inputs.ios-bump }}
+          ANDROID_BUMP: ${{ inputs.android-bump }}
+        run: |
+          xmtp-release create-release-branch \
+            --version "$RELEASE_VERSION" \
+            --base "$BASE_REF" \
+            --ios "$IOS_BUMP" \
+            --android "$ANDROID_BUMP" \
+            ${{ inputs.node && '--node' || '' }} \
+            ${{ inputs.wasm && '--wasm' || '' }}
+
+          git push -u origin "release/${RELEASE_VERSION}"
+      - name: Create pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          BRANCH="release/${RELEASE_VERSION}"
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "Release ${RELEASE_VERSION}" \
+            --body "$(cat <<EOF
+          ## Release ${RELEASE_VERSION}
+
+          This PR was created by the Create Release Branch workflow.
+
+          ### Checklist
+          - [ ] Release notes reviewed and finalized
+          - [ ] All SDK versions bumped
+          - [ ] RC published and validated
+          - [ ] Final release published via Release workflow
+
+          > **Note:** This PR will be merged automatically by the Release workflow upon final release.
+          EOF
+          )"
+
+  release-notes:
+    needs: create-branch
+    uses: ./.github/workflows/release-notes.yml
+    with:
+      release-branch: release/${{ inputs.version }}
+    secrets: inherit

@@ -1,7 +1,7 @@
 //! Common Test Utilities
 use crate::time::Expired;
-use rand::distributions::DistString;
-use rand::{Rng, distributions::Alphanumeric, seq::IteratorRandom};
+use rand::distr::SampleString;
+use rand::{RngExt, distr::Alphanumeric, seq::IteratorRandom};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::{future::Future, sync::OnceLock};
@@ -94,7 +94,8 @@ where
     let filter = || {
         EnvFilter::builder()
             .with_default_directive(tracing::metadata::LevelFilter::INFO.into())
-            .from_env_lossy()
+            .from_env()
+            .expect("invalid environment log filter")
     };
 
     vec![
@@ -149,11 +150,22 @@ pub fn logger() {
 
     crate::wasm_or_native! {
         wasm => {
+            use tracing_wasm::{ConsoleConfig, WASMLayerConfigBuilder, WASMLayer};
             INIT.get_or_init(|| {
                 let filter = tracing_subscriber::EnvFilter::builder().parse("debug").unwrap();
 
+                // this makes error logs in CI a little easier to read
+                let config = if cfg!(feature = "test-utils") {
+                    WASMLayerConfigBuilder::new()
+                        .set_console_config(ConsoleConfig::ReportWithoutConsoleColor)
+                        .build()
+                } else {
+                    WASMLayerConfigBuilder::new()
+                        .set_console_config(ConsoleConfig::ReportWithConsoleColor)
+                        .build()
+                };
                 tracing_subscriber::registry()
-                    .with(tracing_wasm::WASMLayer::default())
+                    .with(WASMLayer::new(config))
                     .with(filter)
                     .init();
 
@@ -210,11 +222,11 @@ pub fn rand_account_address() -> String {
 }
 
 pub fn rand_u64() -> u64 {
-    crate::rng().r#gen()
+    crate::rng().random()
 }
 
 pub fn rand_i64() -> i64 {
-    crate::rng().r#gen()
+    crate::rng().random()
 }
 
 pub fn tmp_path() -> String {
@@ -226,8 +238,8 @@ pub fn tmp_path() -> String {
 }
 
 pub fn rand_time() -> i64 {
-    let mut rng = rand::thread_rng();
-    rng.gen_range(0..1_000_000_000)
+    let mut rng = rand::rng();
+    rng.random_range(0..1_000_000_000)
 }
 
 pub async fn wait_for_some<F, Fut, T>(f: F) -> Option<T>

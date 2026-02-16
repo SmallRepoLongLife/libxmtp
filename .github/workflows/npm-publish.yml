@@ -1,0 +1,87 @@
+name: NPM Publish
+
+on:
+  workflow_call:
+    inputs:
+      package-dir:
+        description: 'Path to the npm package directory'
+        required: true
+        type: string
+      sdk:
+        description: 'SDK name for release tools (e.g. node-bindings, wasm-bindings)'
+        required: true
+        type: string
+      version:
+        description: 'The version to publish'
+        required: true
+        type: string
+      artifact-pattern:
+        description: 'Pattern for downloading build artifacts (optional)'
+        required: false
+        type: string
+      artifact-path:
+        description: 'Path to download artifacts to (required if artifact-pattern is set)'
+        required: false
+        type: string
+      ignore-scripts:
+        description: 'Skip npm lifecycle scripts during publish (e.g. prepublishOnly)'
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      version:
+        description: "The published version"
+        value: ${{ jobs.publish.outputs.version }}
+
+jobs:
+  publish:
+    permissions:
+      id-token: write
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ inputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download build artifacts
+        if: ${{ inputs.artifact-pattern != '' }}
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ${{ inputs.artifact-pattern }}
+          merge-multiple: true
+          path: ${{ inputs.artifact-path }}
+
+      - name: Setup node
+        uses: ./.github/actions/setup-node
+        with:
+          cache-dependency-path: "${{ inputs.package-dir }}/yarn.lock"
+
+      - uses: ./.github/actions/setup-release-tools
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.package-dir }}
+        run: yarn
+
+      - name: Set version
+        run: xmtp-release set-manifest-version --sdk "${{ inputs.sdk }}" --version "${{ inputs.version }}"
+
+      - name: Determine NPM tag
+        id: npm-tag
+        run: |
+          if [[ "${{ inputs.version }}" == *"dev"* || "${{ inputs.version }}" == *"rc"* ]]; then
+            echo "tag=prerelease" >> $GITHUB_OUTPUT
+          else
+            echo "tag=latest" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update npm to latest
+        run: npm install -g npm@latest
+
+      - name: Publish to NPM
+        working-directory: ${{ inputs.package-dir }}
+        run: npm publish --provenance ${{ inputs.ignore-scripts && '--ignore-scripts' || '' }} --tag ${{ steps.npm-tag.outputs.tag }}
+
+      - name: Tag release
+        run: xmtp-release tag-release --sdk "${{ inputs.sdk }}" --version "${{ inputs.version }}" --ignore-if-exists

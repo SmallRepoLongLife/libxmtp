@@ -4,9 +4,9 @@ mod logging;
 
 use proc_macro2::*;
 use quote::{quote, quote_spanned};
-use syn::{Data, DeriveInput, parse_macro_input};
+use syn::{Data, DeriveInput, Fields, Path, parse_macro_input};
 
-use crate::logging::{LogEventInput, get_context_fields, get_doc_comment};
+use crate::logging::{LogEventInput, get_context_fields, get_doc_comment, get_icon};
 
 /// A proc macro attribute that wraps the input in an `async_trait` implementation,
 /// delegating to the appropriate `async_trait` implementation based on the target architecture.
@@ -133,6 +133,7 @@ pub fn build_logging_metadata(
             Ok(dc) => dc,
             Err(err) => return err.to_compile_error().into(),
         };
+        let icon = get_icon(&variant.attrs).unwrap_or_default();
         let context_fields = get_context_fields(&variant.attrs);
 
         // Filter out #[context(...)] attributes for the output enum
@@ -167,6 +168,7 @@ pub fn build_logging_metadata(
                 event: #enum_name::#variant_name,
                 doc: #doc_comment,
                 context_fields: &[#(#context_fields_tokens),*],
+                icon: #icon,
             }
         });
 
@@ -230,7 +232,18 @@ pub fn log_event(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         .map(|(i, f)| {
             let name_str = &provided_names[i];
             let value = f.value_tokens();
-            if matches!(f.sigil, Some('%')) {
+            if matches!(f.sigil, Some('#')) {
+                // # sigil (short_hex): always quote the value so hex strings
+                // like "1713e608" aren't misinterpreted as scientific notation
+                quote! {
+                    #name_str => Some(format!("{}: \"{}\"", #name_str, #value))
+                }
+            } else if matches!(f.sigil, Some('$')) {
+                // $ sigil (json): value is already a JSON string from serde_json::to_string
+                quote! {
+                    #name_str => Some(format!("{}: {}", #name_str, #value))
+                }
+            } else if matches!(f.sigil, Some('%')) {
                 quote! {
                     #name_str => Some(format!("{}: {}", #name_str, #value))
                 }
@@ -271,19 +284,19 @@ pub fn log_event(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 
             // Bind installation_id to a variable to extend its lifetime
             let __installation_id = #installation_id;
-            // Hex encode last 4 bytes of installation_id
-            let __installation_bytes: &[u8] = __installation_id.as_ref();
-            let __installation_len = __installation_bytes.len();
-            let __installation_last_4 = if __installation_len >= 4 { &__installation_bytes[__installation_len - 4..] } else { __installation_bytes };
-            let __installation_truncated = hex::encode(__installation_last_4);
+            let __inst = {
+                use xmtp_proto::ShortHex;
+                __installation_id.short_hex()
+            };
+            let __now_ms = xmtp_common::time::now_ms();
 
             // Build message with context for non-structured logging
             let __message = if ::xmtp_common::is_structured_logging() {
                 // Structured logging: include installation_id and timestamp in message
-                format!("➣ {} {{installation_id: {}, timestamp: {}}}", __meta.doc, __installation_truncated, xmtp_common::time::now_ns())
+                format!("➣ {} {{time_ms: {__now_ms}, inst: \"{__inst}\"}}", __meta.doc)
             } else {
                 // Non-structured logging: embed context in message for readability
-                let __context_parts: ::std::vec::Vec<String> = __meta.context_fields
+                let mut __context_parts: ::std::vec::Vec<String> = __meta.context_fields
                     .iter()
                     .filter_map(|&field_name| {
                         match field_name {
@@ -293,12 +306,11 @@ pub fn log_event(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
                     })
                     .collect();
 
-                let __context_str = __context_parts.join(", ");
-                if __context_str.is_empty() {
-                    format!("➣ {} {{installation_id: {}, timestamp: {}}}", __meta.doc, __installation_truncated, xmtp_common::time::now_ns())
-                } else {
-                    format!("➣ {} {{{__context_str}, installation_id: {}, timestamp: {}}}", __meta.doc, __installation_truncated, xmtp_common::time::now_ns())
-                }
+                __context_parts.push(format!("time_ms: {__now_ms}"));
+                __context_parts.push(format!("inst: \"{__inst}\""));
+                let __context_str = __context_parts.join(", ").replace('\n', " ");
+
+                format!("➣ {} {{{__context_str}}}", __meta.doc)
             };
 
             #tracing_call
@@ -418,4 +430,202 @@ impl Attributes {
 
         Err(meta.error("unknown attribute"))
     }
+}
+
+/// Derive macro for the `ErrorCode` trait.
+///
+/// Automatically generates an `error_code()` implementation that returns
+/// `"TypeName::VariantName"` for each enum variant, or `"TypeName"` for structs.
+///
+/// # Example
+///
+/// ```ignore
+/// use xmtp_common::ErrorCode;
+///
+/// #[derive(Debug, thiserror::Error, ErrorCode)]
+/// pub enum GroupError {
+///     #[error("Group not found")]
+///     NotFound,  // Returns "GroupError::NotFound"
+///
+///     #[error("Storage error: {0}")]
+///     #[error_code(inherit)]  // Delegates to StorageError::error_code()
+///     Storage(#[from] StorageError),
+/// }
+/// ```
+///
+/// # Attributes
+///
+/// - `#[error_code(inherit)]` - Delegate to the inner error's `error_code()` method.
+///   Use this for single-field variants that wrap another error implementing `ErrorCode`.
+///
+/// - `#[error_code(remote = "path::Type")]` - Implement `ErrorCode` for a remote type.
+///   The derived item should mirror the remote type's shape. Default codes use the derived
+///   item's type name, so keep it aligned with the remote type's name unless overridden.
+///
+/// - `#[error_code("CustomCode")]` - Override the generated code with a custom value.
+///   Use this to maintain backwards compatibility when renaming variants.
+///
+/// # Example: Custom Code for Backwards Compatibility
+///
+/// ```ignore
+/// #[derive(Debug, thiserror::Error, ErrorCode)]
+/// pub enum MyError {
+///     // Renamed from "OldName" but keeps the old error code
+///     #[error("new name")]
+///     #[error_code("MyError::OldName")]
+///     NewName,
+/// }
+/// ```
+#[derive(Default)]
+struct ErrorCodeAttr {
+    /// Custom code override: #[error_code("CustomCode")]
+    code: Option<String>,
+    /// Inherit from inner error: #[error_code(inherit)]
+    inherit: bool,
+    /// Implement for a remote type path: #[error_code(remote = "path::Type")]
+    remote: Option<Path>,
+}
+
+impl ErrorCodeAttr {
+    fn parse(attrs: &[syn::Attribute]) -> Self {
+        let mut result = Self::default();
+
+        for attr in attrs {
+            if !attr.path().is_ident("error_code") {
+                continue;
+            }
+
+            // Try parsing #[error_code("CustomCode")]
+            if let Ok(lit) = attr.parse_args::<syn::LitStr>() {
+                result.code = Some(lit.value());
+                continue;
+            }
+
+            // Try parsing #[error_code(inherit)] or #[error_code(remote = "path::Type")]
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("inherit") {
+                    result.inherit = true;
+                    Ok(())
+                } else if meta.path.is_ident("remote") {
+                    let value = meta.value()?;
+                    let lit: syn::LitStr = value.parse()?;
+                    let path = lit
+                        .parse::<Path>()
+                        .map_err(|err| meta.error(err.to_string()))?;
+                    result.remote = Some(path);
+                    Ok(())
+                } else {
+                    Err(meta.error(
+                        "expected `inherit`, `remote = \"path::Type\"`, or a string literal",
+                    ))
+                }
+            });
+        }
+
+        result
+    }
+}
+
+#[proc_macro_derive(ErrorCode, attributes(error_code))]
+pub fn derive_error_code(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+    let container_attr = ErrorCodeAttr::parse(&input.attrs);
+    let name_str = container_attr
+        .remote
+        .as_ref()
+        .and_then(|path| {
+            path.segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+        })
+        .unwrap_or_else(|| name.to_string());
+    let target = container_attr
+        .remote
+        .clone()
+        .unwrap_or_else(|| syn::parse_quote!(#name));
+
+    let expanded = match &input.data {
+        Data::Enum(data_enum) => {
+            let code_arms = data_enum.variants.iter().map(|variant| {
+                let variant_name = &variant.ident;
+                let default_code = format!("{}::{}", name_str, variant_name);
+                let attr = ErrorCodeAttr::parse(&variant.attrs);
+
+                if attr.inherit {
+                    // For inherited errors, delegate to the inner error
+                    match &variant.fields {
+                        Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                            quote! {
+                                Self::#variant_name(e) => e.error_code(),
+                            }
+                        }
+                        Fields::Named(fields) if fields.named.len() == 1 => {
+                            let field_name = fields.named.first().unwrap().ident.as_ref().unwrap();
+                            quote! {
+                                Self::#variant_name { #field_name } => #field_name.error_code(),
+                            }
+                        }
+                        _ => {
+                            let span = variant_name.span();
+                            quote_spanned! {span=>
+                                compile_error!("#[error_code(inherit)] requires exactly one field");
+                            }
+                        }
+                    }
+                } else {
+                    // Use custom code if provided, otherwise use default
+                    let code = attr.code.unwrap_or(default_code);
+
+                    // Generate pattern based on fields
+                    match &variant.fields {
+                        Fields::Unit => {
+                            quote! {
+                                Self::#variant_name => #code,
+                            }
+                        }
+                        Fields::Unnamed(_) => {
+                            quote! {
+                                Self::#variant_name(..) => #code,
+                            }
+                        }
+                        Fields::Named(_) => {
+                            quote! {
+                                Self::#variant_name { .. } => #code,
+                            }
+                        }
+                    }
+                }
+            });
+
+            quote! {
+                impl xmtp_common::ErrorCode for #target {
+                    fn error_code(&self) -> &'static str {
+                        match self {
+                            #(#code_arms)*
+                        }
+                    }
+                }
+            }
+        }
+        Data::Struct(_) => {
+            // Check for custom code on struct
+            let code = container_attr.code.unwrap_or_else(|| name_str.clone());
+
+            quote! {
+                impl xmtp_common::ErrorCode for #target {
+                    fn error_code(&self) -> &'static str {
+                        #code
+                    }
+                }
+            }
+        }
+        Data::Union(_) => {
+            return syn::Error::new_spanned(&input, "ErrorCode cannot be derived for unions")
+                .to_compile_error()
+                .into();
+        }
+    };
+
+    expanded.into()
 }

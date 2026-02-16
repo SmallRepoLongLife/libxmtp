@@ -3,10 +3,12 @@ name = "xmtp_configuration"
 edition = "2024"
 license.workspace = true
 version.workspace = true
+description = "global configuration for xmtp crates"
 
 [dependencies]
 openmls.workspace = true
 url.workspace = true
+xmtp-workspace-hack = { version = "0.1", path = "../xmtp-workspace-hack" }
 xmtp_common.workspace = true
 xmtp_cryptography.workspace = true
 

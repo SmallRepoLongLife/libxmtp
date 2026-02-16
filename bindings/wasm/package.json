@@ -1,6 +1,6 @@
 {
   "name": "@xmtp/wasm-bindings",
-  "version": "1.8.0-dev",
+  "version": "1.10.0-dev",
   "description": "WASM bindings for the libXMTP rust library",
   "keywords": [
     "xmtp",
@@ -18,7 +18,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://git@github.com/xmtp/libxmtp.git",
+    "url": "git+https://github.com/xmtp/libxmtp.git",
     "directory": "bindings/wasm"
   },
   "license": "MIT",

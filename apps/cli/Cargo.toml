@@ -7,6 +7,7 @@ name = "xmtp_cli"
 readme = "README.md"
 repository = "https://github.com/xmtp/libxmtp"
 version.workspace = true
+description = "cli that can send and receive messages on XMTP"
 
 [[bin]]
 name = "xmtp_cli"
@@ -36,6 +37,7 @@ tracing-subscriber = { workspace = true, features = [
   "chrono",
 ] }
 valuable = { version = "0.1", features = ["derive"] }
+xmtp-workspace-hack = { version = "0.1", path = "../../crates/xmtp-workspace-hack" }
 xmtp_api = { workspace = true }
 xmtp_api_d14n.workspace = true
 xmtp_common.workspace = true

@@ -5,6 +5,7 @@ use tokio::sync::{broadcast, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
 use xmtp_api_d14n::protocol::{EnvelopeError, V3WelcomeMessageExtractor, WelcomeMessageExtractor};
 use xmtp_api_d14n::stream;
+use xmtp_macro::log_event;
 use xmtp_proto::types::WelcomeMessage;
 
 use tracing::instrument;
@@ -37,7 +38,7 @@ use crate::{
     subscriptions::d14n_compat::{V3OrD14n, decode_welcome_message},
 };
 use thiserror::Error;
-use xmtp_common::{MaybeSend, RetryableError, StreamHandle, retryable};
+use xmtp_common::{ErrorCode, Event, MaybeSend, RetryableError, StreamHandle, retryable};
 use xmtp_db::{
     NotFound, StorageError,
     consent_record::{ConsentState, StoredConsentRecord},
@@ -172,7 +173,7 @@ impl StreamMessages for broadcast::Receiver<LocalEvents> {
     }
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, ErrorCode)]
 pub enum SubscribeError {
     #[error(transparent)]
     Group(#[from] Box<GroupError>),
@@ -420,27 +421,6 @@ where
         StreamAllMessages::new_owned(self.context.clone(), conversation_type, consent_state).await
     }
 
-    #[tracing::instrument(level = "trace", skip_all)]
-    #[cfg(any(test, feature = "test-utils"))]
-    pub async fn stream_all_messages_owned_with_stats(
-        &self,
-        conversation_type: Option<ConversationType>,
-        consent_state: Option<Vec<ConsentState>>,
-    ) -> Result<impl StreamWithStats<Item = Result<StoredGroupMessage>> + 'static> {
-        tracing::debug!(
-            inbox_id = self.inbox_id(),
-            installation_id = %self.context.installation_id(),
-            conversation_type = ?conversation_type,
-            "stream all messages"
-        );
-
-        let stream =
-            StreamAllMessages::new_owned(self.context.clone(), conversation_type, consent_state)
-                .await?;
-
-        Ok(StreamStatsWrapper::new(stream))
-    }
-
     pub fn stream_all_messages_with_callback(
         context: Context,
         conversation_type: Option<ConversationType>,
@@ -465,10 +445,21 @@ where
             futures::pin_mut!(stream);
             let _ = tx.send(());
 
+            log_event!(
+                Event::StreamOpened,
+                context.installation_id(),
+                kind = ?StreamKind::All
+            );
+
             while let Some(message) = stream.next().await {
                 callback(message)
             }
             tracing::debug!("`stream_all_messages` stream ended, dropping stream");
+            log_event!(
+                Event::StreamClosed,
+                context.installation_id(),
+                kind = ?StreamKind::All
+            );
             on_close();
             Ok::<_, SubscribeError>(())
         })
@@ -539,6 +530,43 @@ where
     }
 }
 
+impl<Context> Client<Context>
+where
+    Context: XmtpSharedContext + 'static,
+    Context::ApiClient: XmtpMlsStreams + 'static,
+    Context::MlsStorage: 'static,
+    <Context::ApiClient as XmtpMlsStreams>::GroupMessageStream: Unpin,
+    <Context::ApiClient as XmtpMlsStreams>::WelcomeMessageStream: Unpin,
+{
+    #[tracing::instrument(level = "trace", skip_all)]
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn stream_all_messages_owned_with_stats(
+        &self,
+        conversation_type: Option<ConversationType>,
+        consent_state: Option<Vec<ConsentState>>,
+    ) -> Result<impl StreamWithStats<Item = Result<StoredGroupMessage>> + 'static> {
+        tracing::debug!(
+            inbox_id = self.inbox_id(),
+            installation_id = %self.context.installation_id(),
+            conversation_type = ?conversation_type,
+            "stream all messages"
+        );
+
+        let stream =
+            StreamAllMessages::new_owned(self.context.clone(), conversation_type, consent_state)
+                .await?;
+
+        Ok(StreamStatsWrapper::new(stream))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum StreamKind {
+    All,
+    Conversations,
+    Messages,
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::context::XmtpSharedContext;
@@ -557,16 +585,15 @@ pub(crate) mod tests {
     #[macro_export]
     macro_rules! assert_msg {
         ($stream:expr, $expected:expr) => {
+            let next = $stream
+                .next()
+                .await
+                .unwrap()
+                .inspect_err(|e| tracing::error!("{}", e.to_string()))
+                .unwrap();
+
             assert_eq!(
-                String::from_utf8_lossy(
-                    $stream
-                        .next()
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .decrypted_message_bytes
-                        .as_slice()
-                ),
+                String::from_utf8_lossy(next.decrypted_message_bytes.as_slice()),
                 String::from_utf8_lossy($expected.as_bytes())
             );
         };

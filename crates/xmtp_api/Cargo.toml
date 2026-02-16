@@ -3,6 +3,7 @@ name = "xmtp_api"
 edition = "2024"
 license.workspace = true
 version.workspace = true
+description = "XMTP Api high level wrapper"
 
 [lints]
 workspace = true
@@ -14,6 +15,7 @@ hex.workspace = true
 prost = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tracing.workspace = true
+xmtp-workspace-hack = { version = "0.1", path = "../xmtp-workspace-hack" }
 xmtp_api_d14n = { workspace = true }
 xmtp_common.workspace = true
 xmtp_id.workspace = true

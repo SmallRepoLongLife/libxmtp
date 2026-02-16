@@ -36,7 +36,7 @@ impl EthereumWallet {
 
 impl Default for EthereumWallet {
     fn default() -> Self {
-        Self(SigningKey::random(&mut xmtp_cryptography::rand::rng()))
+        Self::from_bytes(xmtp_cryptography::rand::rand_array())
     }
 }
 
@@ -187,6 +187,12 @@ pub struct Group {
     pub member_size: u32,
     /// members by inbox id
     pub members: Vec<InboxId>,
+}
+
+impl std::fmt::Display for Group {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex::encode(self.id))
+    }
 }
 
 impl redb::Value for Group {

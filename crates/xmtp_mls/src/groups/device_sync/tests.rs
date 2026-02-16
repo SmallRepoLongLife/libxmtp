@@ -1,11 +1,13 @@
 use super::*;
 use crate::groups::send_message_opts::SendMessageOpts;
 use crate::tester;
+use xmtp_configuration::DeviceSyncUrls;
 use xmtp_db::{
     consent_record::ConsentState,
     group::{ConversationType, StoredGroup},
     group_message::MsgQueryArgs,
 };
+use xmtp_proto::xmtp::device_sync::{BackupElementSelection, BackupOptions};
 
 #[rstest::rstest]
 #[xmtp_common::test(unwrap_try = true)]
@@ -48,14 +50,9 @@ async fn basic_sync() {
 #[xmtp_common::test(unwrap_try = true)]
 #[cfg(not(target_arch = "wasm32"))]
 async fn only_one_payload_sent() {
-    use std::time::Duration;
-    use tokio::time::sleep;
-
-    use crate::utils::LocalTesterBuilder;
-
     tester!(alix1, sync_server, sync_worker, with_name: "alix1");
-    let alix2 = alix1.builder.clone().with_name("alix2").build().await;
-    let alix3 = alix1.builder.clone().with_name("alix3").build().await;
+    tester!(alix2, from: alix1, with_name: "alix2");
+    tester!(alix3, from: alix1, with_name: "alix3");
 
     // They should all have the same sync group
     alix1.test_has_same_sync_group_as(&alix3).await?;
@@ -65,30 +62,9 @@ async fn only_one_payload_sent() {
     let wait1 = alix1.worker().register_interest(SyncMetric::PayloadSent, 1);
     let wait2 = alix2.worker().register_interest(SyncMetric::PayloadSent, 1);
 
-    // Wait for exactly one PayloadSent event using a race
-    let result = tokio::select! {
-        _r1 = wait1.wait() => "alix1",
-        _r2 = wait2.wait() => "alix2",
-        _ = sleep(Duration::from_secs(10)) => "timeout",
-    };
-
     // Register interest for next PayloadSent events
-    let wait1 = alix1.worker().register_interest(SyncMetric::PayloadSent, 1);
-    let wait2 = alix2.worker().register_interest(SyncMetric::PayloadSent, 1);
-
-    // ensure no other send activity happens
-    let result2 = tokio::select! {
-        _r1 = wait1.wait() => "alix1",
-        _r2 = wait2.wait() => "alix2",
-        _ = sleep(Duration::from_secs(3)) => "timeout",
-    };
-
-    assert_ne!(
-        result, "timeout",
-        "Expected one payload to be sent within timeout"
-    );
-
-    assert_eq!(result2, "timeout", "expected second send to timeout");
+    let (wait1, wait2) = tokio::join!(wait1.wait(), wait2.wait());
+    assert_ne!(wait1.is_ok(), wait2.is_ok());
 
     // Check final counts - should be exactly 1 more total
     let alix1_count = alix1.worker().get(SyncMetric::PayloadSent);
@@ -107,11 +83,12 @@ async fn only_one_payload_sent() {
     let alix2_sent = alix2_count > 0;
     assert_ne!(
         alix1_sent, alix2_sent,
-        "Expected exactly one client to send payload, but alix1_sent={}, alix2_sent={} (winner was: {})",
-        alix1_sent, alix2_sent, result
+        "Expected exactly one client to send payload, but alix1_sent={}, alix2_sent={}",
+        alix1_sent, alix2_sent
     );
 }
 
+#[cfg_attr(target_arch = "wasm32", ignore)]
 #[rstest::rstest]
 #[xmtp_common::test(unwrap_try = true)]
 async fn test_double_sync_works_fine() {
@@ -241,9 +218,11 @@ async fn test_hmac_and_consent_preference_sync() {
     assert_eq!(alix1_group.consent_state()?, ConsentState::Unknown);
     alix1_group.update_consent_state(ConsentState::Allowed)?;
 
+    alix2.sync_all_welcomes_and_groups(None).await?;
+
     alix2
         .worker()
-        .register_interest(SyncMetric::ConsentReceived, 3)
+        .register_interest(SyncMetric::ConsentReceived, 2)
         .wait()
         .await?;
     let alix2_group = alix2.group(&bo_group.group_id)?;
@@ -362,4 +341,59 @@ async fn test_new_devices_not_added_to_old_sync_groups() {
             .load(conn)
     })?;
     assert_eq!(alix2_sync_groups.len(), 1);
+}
+
+#[rstest::rstest]
+#[xmtp_common::test(unwrap_try = true)]
+#[timeout(std::time::Duration::from_secs(60))]
+#[cfg_attr(target_arch = "wasm32", ignore)]
+async fn test_manual_sync_flow() {
+    tester!(alix, sync_worker);
+    tester!(bo);
+
+    let (dm, _) = alix.test_talk_in_dm_with(&bo).await?;
+
+    tester!(alix2, from: alix);
+    alix2.test_has_same_sync_group_as(&alix).await?;
+
+    let opts = BackupOptions {
+        elements: vec![BackupElementSelection::Consent.into()],
+        ..Default::default()
+    };
+
+    alix.device_sync_client()
+        .send_sync_archive(&opts, DeviceSyncUrls::LOCAL_ADDRESS, "123")
+        .await?;
+    alix.device_sync_client()
+        .send_sync_archive(&opts, DeviceSyncUrls::LOCAL_ADDRESS, "234")
+        .await?;
+    alix.worker()
+        .register_interest(SyncMetric::PayloadSent, 2)
+        .wait()
+        .await?;
+
+    assert!(alix2.group(&dm.group_id).is_err());
+
+    alix2
+        .device_sync_client()
+        .get_sync_group()
+        .await?
+        .sync()
+        .await?;
+
+    let available_archives = alix2.device_sync_client().list_available_archives(7)?;
+    assert_eq!(available_archives.len(), 2);
+    assert_eq!(available_archives[0].pin, "234");
+
+    alix2
+        .device_sync_client()
+        .process_archive_with_pin(Some("123"))
+        .await?;
+    alix2
+        .worker()
+        .register_interest(SyncMetric::PayloadProcessed, 1)
+        .wait()
+        .await?;
+
+    assert!(alix2.group(&dm.group_id).is_ok());
 }

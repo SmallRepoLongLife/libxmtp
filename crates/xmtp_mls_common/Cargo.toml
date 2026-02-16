@@ -3,6 +3,7 @@ name = "xmtp_mls_common"
 edition = "2024"
 license.workspace = true
 version.workspace = true
+description = "common MLS utilties"
 
 [lints]
 workspace = true
@@ -13,6 +14,7 @@ openmls.workspace = true
 prost.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+xmtp-workspace-hack = { version = "0.1", path = "../xmtp-workspace-hack" }
 xmtp_common.workspace = true
 xmtp_configuration.workspace = true
 xmtp_cryptography.workspace = true

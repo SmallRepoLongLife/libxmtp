@@ -2,6 +2,8 @@
 edition = "2024"
 name = "bindings_node"
 version.workspace = true
+description = "nodeJS bindings to the XMTP mls libraries"
+license.workspace = true
 
 [lints]
 workspace = true
@@ -34,6 +36,7 @@ tracing-subscriber = { workspace = true, features = [
 xmtp_api.workspace = true
 xmtp_api_d14n.workspace = true
 xmtp_common = { workspace = true, features = ["logging"] }
+xmtp_configuration.workspace = true
 xmtp_content_types.workspace = true
 xmtp_cryptography.workspace = true
 xmtp_db.workspace = true
@@ -42,8 +45,8 @@ xmtp_mls.workspace = true
 xmtp_proto.workspace = true
 
 # For some reason these don't work when added as dev-dependencies
+xmtp-workspace-hack = { version = "0.1", path = "../../crates/xmtp-workspace-hack" }
 xmtp_api_grpc = { workspace = true, optional = true }
-xmtp_configuration = { workspace = true, optional = true }
 
 [build-dependencies]
 napi-build = "2.0.1"
@@ -60,7 +63,6 @@ volumes = ["__LIB12_DEP=../"]
 [features]
 test-utils = [
   "dep:xmtp_api_grpc",
-  "dep:xmtp_configuration",
   "xmtp_api_grpc/test-utils",
   "xmtp_mls/test-utils",
   "xmtp_proto/test-utils",

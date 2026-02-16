@@ -1,0 +1,22 @@
+name: Lint Node
+on:
+  workflow_call:
+jobs:
+  lint:
+    name: Lint (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup node
+        uses: ./.github/actions/setup-node
+        with:
+          cache-dependency-path: "bindings/node/yarn.lock"
+      - name: Install dependencies
+        working-directory: bindings/node
+        run: |
+          yarn
+      - name: Format check
+        working-directory: bindings/node
+        run: |
+          yarn format:check

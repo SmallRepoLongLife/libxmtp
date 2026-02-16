@@ -3,6 +3,7 @@ use super::mls_ext::{UnwrapWelcomeError, WrapWelcomeError};
 use super::mls_sync::GroupMessageProcessingError;
 use super::summary::SyncSummary;
 use super::{intents::IntentError, validated_commit::CommitValidationError};
+use crate::groups::device_sync::DeviceSyncError;
 use crate::identity::IdentityError;
 use crate::mls_store::MlsStoreError;
 use crate::{
@@ -16,6 +17,7 @@ use openmls::{
 };
 use std::collections::HashSet;
 use thiserror::Error;
+use xmtp_common::ErrorCode;
 use xmtp_common::retry::RetryableError;
 use xmtp_content_types::CodecError;
 use xmtp_cryptography::signature::IdentifierValidationError;
@@ -24,7 +26,7 @@ use xmtp_db::sql_key_store;
 use xmtp_mls_common::group_metadata::GroupMetadataError;
 use xmtp_mls_common::group_mutable_metadata::GroupMutableMetadataError;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, ErrorCode)]
 pub struct ReceiveErrors {
     /// list of message ids we received
     ids: Vec<u64>,
@@ -69,9 +71,10 @@ impl std::fmt::Display for ReceiveErrors {
         Ok(())
     }
 }
-#[derive(Debug, Error)]
+#[derive(Debug, Error, ErrorCode)]
 pub enum GroupError {
     #[error(transparent)]
+    #[error_code(inherit)]
     NotFound(#[from] NotFound),
     #[error("Max user limit exceeded.")]
     UserLimitExceeded,
@@ -183,6 +186,8 @@ pub enum GroupError {
     UninitializedField(#[from] derive_builder::UninitializedFieldError),
     #[error(transparent)]
     DeleteMessage(#[from] DeleteMessageError),
+    #[error(transparent)]
+    DeviceSync(#[from] Box<DeviceSyncError>),
 }
 
 #[derive(Error, Debug)]
@@ -325,6 +330,7 @@ impl RetryableError for GroupError {
             Self::Diesel(e) => e.is_retryable(),
             Self::LeaveCantProcessed(e) => e.is_retryable(),
             Self::DeleteMessage(e) => e.is_retryable(),
+            Self::DeviceSync(e) => e.is_retryable(),
             Self::NotFound(_)
             | Self::UserLimitExceeded
             | Self::InvalidGroupMembership

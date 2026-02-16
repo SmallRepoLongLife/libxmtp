@@ -1,0 +1,51 @@
+name: Test WASM
+on:
+  workflow_call:
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+jobs:
+  wasm-ci:
+    name: Test (WASM)
+    runs-on: warp-ubuntu-latest-x64-16x
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+        with:
+          github-token: ${{ github.token }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          sccache: "true"
+      - name: Install omnix
+        run: nix profile install nixpkgs#omnix
+
+      - name: Start Docker containers
+        run: |
+          nix build .#validation-service-image-musl64
+          dev/docker/up
+      - name: run tests
+        run: om ci run .#wasm
+
+  wasm-integration:
+    name: WASM Integration Tests
+    runs-on: warp-ubuntu-latest-x64-16x
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+        with:
+          github-token: ${{ github.token }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          sccache: "true"
+      - name: Start Docker containers
+        run: |
+          nix build .#validation-service-image-musl64
+          dev/docker/up
+      - name: webassembly integration tests
+        working-directory: bindings/wasm
+        run: |
+          yarn
+          yarn build:test
+          yarn typecheck
+          yarn playwright install
+          yarn test:integration

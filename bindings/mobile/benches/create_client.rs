@@ -10,13 +10,12 @@ use xmtp_common::{
     bench::{BENCH_ROOT_SPAN, bench_async_setup},
     tmp_path,
 };
+use xmtp_configuration::DeviceSyncUrls;
 use xmtp_id::associations::test_utils::WalletTestExt;
-use xmtpv3::identity::FfiIdentifier;
+use xmtpv3::{DbOptions, identity::FfiIdentifier};
 
 #[macro_use]
 extern crate tracing;
-
-const HISTORY_SYNC_URL: &str = xmtp_configuration::DeviceSyncUrls::LOCAL_ADDRESS;
 
 fn setup() -> Runtime {
     Builder::new_multi_thread()
@@ -64,13 +63,17 @@ fn create_ffi_client(c: &mut Criterion) {
                 xmtpv3::mls::create_client(
                     api,
                     sync_api,
-                    Some(path),
-                    Some(vec![0u8; 32]),
+                    DbOptions::new(
+                        Some(path),
+                        Some(xmtp_db::EncryptedMessageStore::<()>::generate_enc_key().into()),
+                        None,
+                        None,
+                    ),
                     &inbox_id,
                     ffi_ident,
                     nonce,
                     None,
-                    Some(HISTORY_SYNC_URL.to_string()),
+                    Some(DeviceSyncUrls::LOCAL_ADDRESS.to_string()),
                     None,
                     None,
                     None,
@@ -105,13 +108,17 @@ fn cached_create_ffi_client(c: &mut Criterion) {
         xmtpv3::mls::create_client(
             api.clone(),
             api.clone(),
-            Some(path.clone()),
-            Some(vec![0u8; 32]),
+            DbOptions::new(
+                Some(tmp_path()),
+                Some(xmtp_db::EncryptedMessageStore::<()>::generate_enc_key().into()),
+                None,
+                None,
+            ),
             &inbox_id.clone(),
             ffi_ident,
             nonce,
             None,
-            Some(HISTORY_SYNC_URL.to_string()),
+            Some(DeviceSyncUrls::LOCAL_ADDRESS.to_string()),
             None,
             None,
             None,
@@ -132,7 +139,7 @@ fn cached_create_ffi_client(c: &mut Criterion) {
                     address.clone(),
                     nonce,
                     path.clone(),
-                    HISTORY_SYNC_URL.to_string(),
+                    DeviceSyncUrls::LOCAL_ADDRESS.to_string(),
                     span.clone(),
                 )
             },
@@ -141,8 +148,12 @@ fn cached_create_ffi_client(c: &mut Criterion) {
                 xmtpv3::mls::create_client(
                     api.clone(),
                     api,
-                    Some(path),
-                    Some(vec![0u8; 32]),
+                    DbOptions::new(
+                        Some(path),
+                        Some(xmtp_db::EncryptedMessageStore::<()>::generate_enc_key().into()),
+                        None,
+                        None,
+                    ),
                     &inbox_id,
                     ffi_ident,
                     nonce,

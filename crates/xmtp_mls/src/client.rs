@@ -31,7 +31,7 @@ use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use xmtp_api::{ApiClientWrapper, XmtpApi};
-use xmtp_common::{Event, Retry, fmt::ShortHex, retry_async, retryable};
+use xmtp_common::{ErrorCode, Event, Retry, retry_async, retryable};
 use xmtp_cryptography::signature::IdentifierValidationError;
 use xmtp_db::{
     ConnectionExt, NotFound, StorageError, XmtpDb,
@@ -71,9 +71,10 @@ pub enum Network {
     Prod,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, ErrorCode)]
 pub enum ClientError {
     #[error(transparent)]
+    #[error_code(inherit)]
     AddressValidation(#[from] IdentifierValidationError),
     #[error("could not publish: {0}")]
     PublishError(String),
@@ -277,6 +278,13 @@ where
     /// higher-level queries are defined
     pub fn db(&self) -> <Context::Db as XmtpDb>::DbQuery {
         self.context.db()
+    }
+
+    /// This associates an installation_id with a human-readable
+    /// name and makes the logs a little easier to read.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_name(&self, name: &str) {
+        log_event!(Event::AssociateName, self.context.installation_id(), name);
     }
 
     pub fn device_sync_server_url(&self) -> Option<&String> {
@@ -543,7 +551,7 @@ where
         log_event!(
             Event::CreatedGroup,
             self.context.installation_id(),
-            group_id = group.group_id.short_hex()
+            group_id = group.group_id
         );
 
         // notify streams of our new group
@@ -599,8 +607,8 @@ where
         log_event!(
             Event::CreatedDM,
             self.context.installation_id(),
-            group_id = group.group_id.short_hex(),
-            target_inbox_id
+            group_id = group.group_id,
+            target_inbox = target_inbox_id
         );
         group.add_members(&[target_inbox_id]).await?;
 
@@ -1002,10 +1010,14 @@ where
             .await
     }
 
-    pub async fn sync_all_welcomes_and_history_sync_groups(
+    pub async fn sync_all_welcomes_and_device_sync_groups(
         &self,
     ) -> Result<GroupSyncSummary, ClientError> {
         self.sync_welcomes().await?;
+        self.sync_all_device_sync_groups().await
+    }
+
+    pub async fn sync_all_device_sync_groups(&self) -> Result<GroupSyncSummary, ClientError> {
         let groups = self
             .context
             .db()
@@ -1524,6 +1536,7 @@ pub(crate) mod tests {
         assert_eq!(bo_messages2.len(), 3);
     }
 
+    #[cfg_attr(all(feature = "d14n", target_arch = "wasm32"), ignore)]
     #[xmtp_common::test]
     async fn test_sync_100_allowed_groups_performance() {
         tester!(alix);

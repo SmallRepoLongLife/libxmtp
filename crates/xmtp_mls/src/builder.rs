@@ -23,7 +23,7 @@ use xmtp_api_d14n::{
     TrackedStatsClient,
     protocol::{CursorStore, XmtpQuery},
 };
-use xmtp_common::{Event, Retry};
+use xmtp_common::{ErrorCode, Event, Retry};
 use xmtp_cryptography::signature::IdentifierValidationError;
 use xmtp_db::{DbConnection, XmtpMlsStorageProvider};
 use xmtp_db::{XmtpDb, sql_key_store::SqlKeyStore};
@@ -32,9 +32,10 @@ use xmtp_macro::log_event;
 
 type ContextParts<Api, S, Db> = Arc<XmtpMlsLocalContext<Api, Db, S>>;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, ErrorCode)]
 pub enum ClientBuilderError {
     #[error(transparent)]
+    #[error_code(inherit)]
     AddressValidation(#[from] IdentifierValidationError),
     #[error("Missing parameter: {parameter}")]
     MissingParameter { parameter: &'static str },
@@ -345,7 +346,7 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
             inbox_id = context.inbox_id(),
             full_installation_id = hex::encode(context.installation_id()),
             device_sync_enabled = context.device_sync_worker_enabled(),
-            disabled_workers = disable_workers
+            disabled_workers = disable_workers,
         );
 
         let client = Client {

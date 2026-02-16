@@ -88,7 +88,7 @@ async fn new_client_inner(
         .into_os_string()
         .into_string()
         .map_err(|_| eyre::eyre!("Conversion failed from OsString"))?;
-    let db = NativeDb::new_unencrypted(&StorageOption::Persistent(path))?;
+    let db = NativeDb::builder().persistent(path).build_unencrypted()?;
     db.db().set_sqlcipher_log("NONE")?;
     let db = EncryptedMessageStore::new(db)?;
     let cursor_store = Arc::new(SqliteCursorStore::new(db.db()));
@@ -145,14 +145,15 @@ fn existing_client_inner(
 ) -> Result<crate::DbgClient> {
     let api = network.client_bundle()?;
     let sync_api = network.client_bundle()?;
+    let path = db_path.clone().into_os_string().into_string().unwrap();
 
-    let db = xmtp_db::NativeDb::new_unencrypted(&StorageOption::Persistent(
-        db_path.clone().into_os_string().into_string().unwrap(),
-    ))
-    .wrap_err(format!(
-        "tried to open sqlite database file@{}",
-        db_path.to_string_lossy()
-    ))?;
+    let db = NativeDb::builder()
+        .persistent(path)
+        .build_unencrypted()
+        .wrap_err(format!(
+            "tried to open sqlite database file@{}",
+            db_path.to_string_lossy()
+        ))?;
     db.db().set_sqlcipher_log("NONE")?;
     let store = EncryptedMessageStore::new(db).inspect_err(|e| {
         error!(db_path = %(&db_path.as_path().display()), "{e}");
@@ -208,7 +209,7 @@ pub fn load_n_identities(
     network: &args::BackendOpts,
     n: usize,
 ) -> Result<Arc<HashMap<InboxId, Arc<Mutex<crate::DbgClient>>>>> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let now = std::time::Instant::now();
     let identities = store.random_n(u64::from(network), &mut rng, n)?;
     tracing::info!("loaded {} identities in {:?}", n, now.elapsed());
