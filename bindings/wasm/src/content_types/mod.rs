@@ -1,5 +1,46 @@
 use bindings_wasm_macros::wasm_bindgen_numbered_enum;
+use thiserror::Error;
+use wasm_bindgen::JsError;
+use xmtp_common::ErrorCode;
 use xmtp_db::group_message::ContentType as XmtpContentType;
+
+use crate::ErrorWrapper;
+
+/// Error type for content type conversion failures in WASM bindings.
+///
+/// Provides structured error codes via `ErrorCode` derive, ensuring
+/// all content type errors are prefixed with `[ContentTypeError::Variant]`
+/// when surfaced to JavaScript.
+#[derive(Debug, Error, ErrorCode)]
+pub enum ContentTypeError {
+  /// Invalid data.
+  ///
+  /// Content type data failed validation. Not retryable.
+  #[error("{0}")]
+  InvalidData(String),
+  /// Timestamp out of range.
+  ///
+  /// Timestamp value is outside the representable range. Not retryable.
+  #[error("{0}")]
+  TimestampOutOfRange(String),
+  /// Codec error.
+  ///
+  /// Content type codec encoding or decoding failed. Not retryable.
+  #[error("{0}")]
+  Codec(String),
+  /// Crypto error.
+  ///
+  /// Cryptographic operation for content type failed. Not retryable.
+  #[error("{0}")]
+  Crypto(String),
+}
+
+impl ContentTypeError {
+  /// Converts this error into a `JsError` with the `[ErrorCode] message` format.
+  pub fn into_js(self) -> JsError {
+    ErrorWrapper(self).into()
+  }
+}
 
 pub mod actions;
 pub mod attachment;

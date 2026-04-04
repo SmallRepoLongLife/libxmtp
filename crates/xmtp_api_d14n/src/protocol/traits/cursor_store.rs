@@ -36,7 +36,7 @@ impl RetryableError for CursorStoreError {
     }
 }
 
-impl<E: std::error::Error> From<CursorStoreError> for ApiClientError<E> {
+impl From<CursorStoreError> for ApiClientError {
     fn from(value: CursorStoreError) -> Self {
         ApiClientError::Other(Box::new(value) as Box<_>)
     }
@@ -46,85 +46,94 @@ impl<E: std::error::Error> From<CursorStoreError> for ApiClientError<E> {
 /// _NOTE:_, implementations decide retry strategy. the exact implementation of persistence (or lack)
 /// is up to implementors. functions are assumed to be idempotent & atomic.
 pub trait CursorStore: MaybeSend + MaybeSync {
-    // /// Get the last seen cursor per originator
-    // fn last_seen(&self, topic: &Topic) -> Result<GlobalCursor, Self::Error>;
-
-    /// Compute the lowest common cursor across a set of topics.
-    /// For each node_id, uses the **minimum** sequence ID seen across all topics.
-    fn lowest_common_cursor(&self, topics: &[&Topic]) -> Result<GlobalCursor, CursorStoreError>;
-
-    /// get the highest sequence id for a topic, regardless of originator
-    fn latest(&self, topic: &Topic) -> Result<GlobalCursor, CursorStoreError>;
-
-    /// Get the latest cursor for each originator
-    fn latest_per_originator(
+    /// Return the highest sequence id seen for each originator on a given topic.
+    ///
+    /// Pass `None` for `originators` to return cursors for all known originators (used by d14n
+    /// callers that subscribe to every originator). Pass `Some(&[...])` to restrict the result
+    /// to specific originators (used by v3 callers that only care about e.g. commits + app
+    /// messages).
+    fn latest(
         &self,
         topic: &Topic,
-        originators: &[&OriginatorId],
+        originators: Option<&[&OriginatorId]>,
     ) -> Result<GlobalCursor, CursorStoreError>;
 
+    /// Convenience wrapper around [`latest`](Self::latest) that returns a single [`Cursor`] for
+    /// one originator. Used when a caller needs the sequence id for exactly one originator on a
+    /// topic (e.g. welcome messages on v3).
     fn latest_for_originator(
         &self,
         topic: &Topic,
         originator: &OriginatorId,
     ) -> Result<Cursor, CursorStoreError> {
-        let sid = self
-            .latest_per_originator(topic, &[originator])?
-            .get(originator);
+        let sid = self.latest(topic, Some(&[originator]))?.get(originator);
         Ok(Cursor::new(sid, *originator))
     }
 
-    /// Get the latest cursor for multiple topics at once.
-    /// Returns a HashMap mapping each topic to its GlobalCursor.
+    /// Batch version of [`latest`](Self::latest) — returns the latest cursor for every topic in
+    /// the iterator, without originator filtering. Used when subscribing to many group topics at
+    /// once so that the stream can resume from the right position per-topic.
     fn latest_for_topics(
         &self,
         topics: &mut dyn Iterator<Item = &Topic>,
     ) -> Result<HashMap<Topic, GlobalCursor>, CursorStoreError>;
 
-    // temp until reliable streams
-    fn lcc_maybe_missing(&self, topic: &[&Topic]) -> Result<GlobalCursor, CursorStoreError>;
-    /// find dependencies of each locally-stored intent payload hash
+    /// Look up the cursor that each locally-published intent depends on, keyed by the intent's
+    /// payload hash. The returned cursors are attached as `depends_on` metadata when publishing
+    /// group messages so that the ordering layer can enforce causal delivery.
     fn find_message_dependencies(
         &self,
         hashes: &[&[u8]],
     ) -> Result<HashMap<Vec<u8>, Cursor>, CursorStoreError>;
 
-    /// ice envelopes that cannot yet be processed
+    /// Stash envelopes whose causal dependencies have not yet been seen (the "icebox").
+    /// They will be retried later when [`resolve_children`](Self::resolve_children) finds that
+    /// their parent cursors have arrived.
     fn ice(&self, orphans: Vec<OrphanedEnvelope>) -> Result<(), CursorStoreError>;
 
-    /// try to resolve any children that may depend on [`Cursor`]
+    /// Check the icebox for envelopes whose causal dependencies are now satisfied by the given
+    /// cursors. Returns the envelopes that are ready to be processed, removing them from the
+    /// icebox.
     fn resolve_children(
         &self,
         cursors: &[Cursor],
     ) -> Result<Vec<OrphanedEnvelope>, CursorStoreError>;
+
+    /// Set the d14n migration cutover timestamp (nanoseconds since epoch). Messages with a
+    /// server timestamp at or after this value should be fetched from the d14n network instead
+    /// of v3.
+    fn set_cutover_ns(&self, cutover_ns: i64) -> Result<(), CursorStoreError>;
+
+    /// Get the d14n migration cutover timestamp (nanoseconds since epoch).
+    /// Returns `i64::MAX` when no cutover has been set yet.
+    fn get_cutover_ns(&self) -> Result<i64, CursorStoreError>;
+
+    /// Get the last time (nanoseconds since epoch) we polled the network for a migration
+    /// cutover update. Used to throttle how often we check.
+    fn get_last_checked_ns(&self) -> Result<i64, CursorStoreError>;
+
+    /// Record the current time (nanoseconds since epoch) as the last migration-cutover check.
+    fn set_last_checked_ns(&self, last_checked_ns: i64) -> Result<(), CursorStoreError>;
+
+    /// Returns `true` if the d14n migration has been fully completed and the client should
+    /// operate exclusively against the d14n network.
+    fn has_migrated(&self) -> Result<bool, CursorStoreError>;
+
+    /// Mark the d14n migration as completed (or not). Once set to `true`, the client stops
+    /// querying v3 endpoints entirely.
+    fn set_has_migrated(&self, has_migrated: bool) -> Result<(), CursorStoreError>;
 }
 
 impl<T: CursorStore> CursorStore for Option<T> {
-    fn lowest_common_cursor(&self, topics: &[&Topic]) -> Result<GlobalCursor, CursorStoreError> {
-        if let Some(c) = self {
-            c.lowest_common_cursor(topics)
-        } else {
-            NoCursorStore.lowest_common_cursor(topics)
-        }
-    }
-
-    fn latest(&self, topic: &Topic) -> Result<GlobalCursor, CursorStoreError> {
-        if let Some(c) = self {
-            c.latest(topic)
-        } else {
-            NoCursorStore.latest(topic)
-        }
-    }
-
-    fn latest_per_originator(
+    fn latest(
         &self,
         topic: &Topic,
-        originators: &[&OriginatorId],
+        originators: Option<&[&OriginatorId]>,
     ) -> Result<GlobalCursor, CursorStoreError> {
         if let Some(c) = self {
-            c.latest_per_originator(topic, originators)
+            c.latest(topic, originators)
         } else {
-            NoCursorStore.latest_per_originator(topic, originators)
+            NoCursorStore.latest(topic, originators)
         }
     }
 
@@ -139,13 +148,6 @@ impl<T: CursorStore> CursorStore for Option<T> {
         }
     }
 
-    fn lcc_maybe_missing(&self, topic: &[&Topic]) -> Result<GlobalCursor, CursorStoreError> {
-        if let Some(c) = self {
-            c.lcc_maybe_missing(topic)
-        } else {
-            NoCursorStore.lcc_maybe_missing(topic)
-        }
-    }
     fn find_message_dependencies(
         &self,
         hashes: &[&[u8]],
@@ -174,23 +176,63 @@ impl<T: CursorStore> CursorStore for Option<T> {
             NoCursorStore.resolve_children(cursors)
         }
     }
+
+    fn set_cutover_ns(&self, cutover_ns: i64) -> Result<(), CursorStoreError> {
+        if let Some(c) = self {
+            c.set_cutover_ns(cutover_ns)
+        } else {
+            NoCursorStore.set_cutover_ns(cutover_ns)
+        }
+    }
+
+    fn get_cutover_ns(&self) -> Result<i64, CursorStoreError> {
+        if let Some(c) = self {
+            c.get_cutover_ns()
+        } else {
+            NoCursorStore.get_cutover_ns()
+        }
+    }
+
+    fn has_migrated(&self) -> Result<bool, CursorStoreError> {
+        if let Some(c) = self {
+            c.has_migrated()
+        } else {
+            NoCursorStore.has_migrated()
+        }
+    }
+
+    fn set_has_migrated(&self, has_migrated: bool) -> Result<(), CursorStoreError> {
+        if let Some(c) = self {
+            c.set_has_migrated(has_migrated)
+        } else {
+            NoCursorStore.set_has_migrated(has_migrated)
+        }
+    }
+
+    fn get_last_checked_ns(&self) -> Result<i64, CursorStoreError> {
+        if let Some(c) = self {
+            c.get_last_checked_ns()
+        } else {
+            NoCursorStore.get_last_checked_ns()
+        }
+    }
+
+    fn set_last_checked_ns(&self, last_checked_ns: i64) -> Result<(), CursorStoreError> {
+        if let Some(c) = self {
+            c.set_last_checked_ns(last_checked_ns)
+        } else {
+            NoCursorStore.set_last_checked_ns(last_checked_ns)
+        }
+    }
 }
 
 impl<T: CursorStore + ?Sized> CursorStore for &T {
-    fn lowest_common_cursor(&self, topics: &[&Topic]) -> Result<GlobalCursor, CursorStoreError> {
-        (**self).lowest_common_cursor(topics)
-    }
-
-    fn latest(&self, topic: &Topic) -> Result<GlobalCursor, CursorStoreError> {
-        (**self).latest(topic)
-    }
-
-    fn latest_per_originator(
+    fn latest(
         &self,
         topic: &Topic,
-        originators: &[&OriginatorId],
+        originators: Option<&[&OriginatorId]>,
     ) -> Result<GlobalCursor, CursorStoreError> {
-        (**self).latest_per_originator(topic, originators)
+        (**self).latest(topic, originators)
     }
 
     fn latest_for_topics(
@@ -198,10 +240,6 @@ impl<T: CursorStore + ?Sized> CursorStore for &T {
         topics: &mut dyn Iterator<Item = &Topic>,
     ) -> Result<HashMap<Topic, GlobalCursor>, CursorStoreError> {
         (**self).latest_for_topics(topics)
-    }
-
-    fn lcc_maybe_missing(&self, topic: &[&Topic]) -> Result<GlobalCursor, CursorStoreError> {
-        (**self).lcc_maybe_missing(topic)
     }
 
     fn find_message_dependencies(
@@ -220,24 +258,40 @@ impl<T: CursorStore + ?Sized> CursorStore for &T {
         cursors: &[Cursor],
     ) -> Result<Vec<OrphanedEnvelope>, CursorStoreError> {
         (**self).resolve_children(cursors)
+    }
+
+    fn set_cutover_ns(&self, cutover_ns: i64) -> Result<(), CursorStoreError> {
+        (**self).set_cutover_ns(cutover_ns)
+    }
+
+    fn get_cutover_ns(&self) -> Result<i64, CursorStoreError> {
+        (**self).get_cutover_ns()
+    }
+
+    fn get_last_checked_ns(&self) -> Result<i64, CursorStoreError> {
+        (**self).get_last_checked_ns()
+    }
+
+    fn set_last_checked_ns(&self, last_checked_ns: i64) -> Result<(), CursorStoreError> {
+        (**self).set_last_checked_ns(last_checked_ns)
+    }
+
+    fn has_migrated(&self) -> Result<bool, CursorStoreError> {
+        (**self).has_migrated()
+    }
+
+    fn set_has_migrated(&self, has_migrated: bool) -> Result<(), CursorStoreError> {
+        (**self).set_has_migrated(has_migrated)
     }
 }
 
 impl<T: CursorStore + ?Sized> CursorStore for Arc<T> {
-    fn lowest_common_cursor(&self, topics: &[&Topic]) -> Result<GlobalCursor, CursorStoreError> {
-        (**self).lowest_common_cursor(topics)
-    }
-
-    fn latest(&self, topic: &Topic) -> Result<GlobalCursor, CursorStoreError> {
-        (**self).latest(topic)
-    }
-
-    fn latest_per_originator(
+    fn latest(
         &self,
         topic: &Topic,
-        originators: &[&OriginatorId],
+        originators: Option<&[&OriginatorId]>,
     ) -> Result<GlobalCursor, CursorStoreError> {
-        (**self).latest_per_originator(topic, originators)
+        (**self).latest(topic, originators)
     }
 
     fn latest_for_topics(
@@ -245,10 +299,6 @@ impl<T: CursorStore + ?Sized> CursorStore for Arc<T> {
         topics: &mut dyn Iterator<Item = &Topic>,
     ) -> Result<HashMap<Topic, GlobalCursor>, CursorStoreError> {
         (**self).latest_for_topics(topics)
-    }
-
-    fn lcc_maybe_missing(&self, topic: &[&Topic]) -> Result<GlobalCursor, CursorStoreError> {
-        (**self).lcc_maybe_missing(topic)
     }
 
     fn find_message_dependencies(
@@ -267,24 +317,40 @@ impl<T: CursorStore + ?Sized> CursorStore for Arc<T> {
         cursors: &[Cursor],
     ) -> Result<Vec<OrphanedEnvelope>, CursorStoreError> {
         (**self).resolve_children(cursors)
+    }
+
+    fn set_cutover_ns(&self, cutover_ns: i64) -> Result<(), CursorStoreError> {
+        (**self).set_cutover_ns(cutover_ns)
+    }
+
+    fn get_cutover_ns(&self) -> Result<i64, CursorStoreError> {
+        (**self).get_cutover_ns()
+    }
+
+    fn get_last_checked_ns(&self) -> Result<i64, CursorStoreError> {
+        (**self).get_last_checked_ns()
+    }
+
+    fn set_last_checked_ns(&self, last_checked_ns: i64) -> Result<(), CursorStoreError> {
+        (**self).set_last_checked_ns(last_checked_ns)
+    }
+
+    fn has_migrated(&self) -> Result<bool, CursorStoreError> {
+        (**self).has_migrated()
+    }
+
+    fn set_has_migrated(&self, has_migrated: bool) -> Result<(), CursorStoreError> {
+        (**self).set_has_migrated(has_migrated)
     }
 }
 
 impl<T: CursorStore + ?Sized> CursorStore for Box<T> {
-    fn lowest_common_cursor(&self, topics: &[&Topic]) -> Result<GlobalCursor, CursorStoreError> {
-        (**self).lowest_common_cursor(topics)
-    }
-
-    fn latest(&self, topic: &Topic) -> Result<GlobalCursor, CursorStoreError> {
-        (**self).latest(topic)
-    }
-
-    fn latest_per_originator(
+    fn latest(
         &self,
         topic: &Topic,
-        originators: &[&OriginatorId],
+        originators: Option<&[&OriginatorId]>,
     ) -> Result<GlobalCursor, CursorStoreError> {
-        (**self).latest_per_originator(topic, originators)
+        (**self).latest(topic, originators)
     }
 
     fn latest_for_topics(
@@ -292,10 +358,6 @@ impl<T: CursorStore + ?Sized> CursorStore for Box<T> {
         topics: &mut dyn Iterator<Item = &Topic>,
     ) -> Result<HashMap<Topic, GlobalCursor>, CursorStoreError> {
         (**self).latest_for_topics(topics)
-    }
-
-    fn lcc_maybe_missing(&self, topic: &[&Topic]) -> Result<GlobalCursor, CursorStoreError> {
-        (**self).lcc_maybe_missing(topic)
     }
 
     fn find_message_dependencies(
@@ -314,6 +376,30 @@ impl<T: CursorStore + ?Sized> CursorStore for Box<T> {
         cursors: &[Cursor],
     ) -> Result<Vec<OrphanedEnvelope>, CursorStoreError> {
         (**self).resolve_children(cursors)
+    }
+
+    fn set_cutover_ns(&self, cutover_ns: i64) -> Result<(), CursorStoreError> {
+        (**self).set_cutover_ns(cutover_ns)
+    }
+
+    fn get_cutover_ns(&self) -> Result<i64, CursorStoreError> {
+        (**self).get_cutover_ns()
+    }
+
+    fn get_last_checked_ns(&self) -> Result<i64, CursorStoreError> {
+        (**self).get_last_checked_ns()
+    }
+
+    fn set_last_checked_ns(&self, last_checked_ns: i64) -> Result<(), CursorStoreError> {
+        (**self).set_last_checked_ns(last_checked_ns)
+    }
+
+    fn has_migrated(&self) -> Result<bool, CursorStoreError> {
+        (**self).has_migrated()
+    }
+
+    fn set_has_migrated(&self, has_migrated: bool) -> Result<(), CursorStoreError> {
+        (**self).set_has_migrated(has_migrated)
     }
 }
 
@@ -322,18 +408,10 @@ impl<T: CursorStore + ?Sized> CursorStore for Box<T> {
 pub struct NoCursorStore;
 
 impl CursorStore for NoCursorStore {
-    fn lowest_common_cursor(&self, _: &[&Topic]) -> Result<GlobalCursor, CursorStoreError> {
-        Ok(GlobalCursor::default())
-    }
-
-    fn latest(&self, _: &Topic) -> Result<GlobalCursor, CursorStoreError> {
-        Ok(GlobalCursor::default())
-    }
-
-    fn latest_per_originator(
+    fn latest(
         &self,
         _: &Topic,
-        _: &[&OriginatorId],
+        _: Option<&[&OriginatorId]>,
     ) -> Result<GlobalCursor, CursorStoreError> {
         Ok(GlobalCursor::default())
     }
@@ -345,10 +423,6 @@ impl CursorStore for NoCursorStore {
         Ok(HashMap::from_iter(
             topics.map(|t| (t.clone(), GlobalCursor::default())),
         ))
-    }
-
-    fn lcc_maybe_missing(&self, _: &[&Topic]) -> Result<GlobalCursor, CursorStoreError> {
-        Ok(GlobalCursor::default())
     }
 
     fn find_message_dependencies(
@@ -367,5 +441,29 @@ impl CursorStore for NoCursorStore {
         _cursors: &[Cursor],
     ) -> Result<Vec<OrphanedEnvelope>, CursorStoreError> {
         Ok(Vec::new())
+    }
+
+    fn set_cutover_ns(&self, _cutover_ns: i64) -> Result<(), CursorStoreError> {
+        Ok(())
+    }
+
+    fn get_cutover_ns(&self) -> Result<i64, CursorStoreError> {
+        Ok(i64::MAX)
+    }
+
+    fn get_last_checked_ns(&self) -> Result<i64, CursorStoreError> {
+        Ok(0)
+    }
+
+    fn set_last_checked_ns(&self, _last_checked_ns: i64) -> Result<(), CursorStoreError> {
+        Ok(())
+    }
+
+    fn has_migrated(&self) -> Result<bool, CursorStoreError> {
+        Ok(false)
+    }
+
+    fn set_has_migrated(&self, _has_migrated: bool) -> Result<(), CursorStoreError> {
+        Ok(())
     }
 }

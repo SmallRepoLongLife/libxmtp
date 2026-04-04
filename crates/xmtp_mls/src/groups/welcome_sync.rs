@@ -72,14 +72,23 @@ where
         match result {
             Ok(mls_group) => {
                 if let Some(mls_group) = &mls_group {
-                    let epoch = mls_group.epoch().await?;
-                    log_event!(
-                        Event::ProcessedWelcome,
-                        self.context.installation_id(),
-                        group_id = mls_group.group_id.as_slice(),
-                        conversation_type = %mls_group.conversation_type,
-                        epoch
-                    );
+                    if let (Ok(epoch), Ok(auth)) = (
+                        mls_group.epoch().await,
+                        mls_group.epoch_authenticator().await,
+                    ) {
+                        log_event!(
+                            Event::ReceivedWelcome,
+                            self.context.installation_id(),
+                            group_id = mls_group.group_id.as_slice(),
+                            conversation_type = %mls_group.conversation_type,
+                            epoch,
+                            epoch_auth = auth
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Failed to lock the mls group for logging ProcessedWelcome."
+                        );
+                    }
                 }
 
                 Ok(mls_group)
@@ -366,7 +375,6 @@ fn filter_groups_with_new_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::groups::mls_ext::WrapperAlgorithm;
     use crate::groups::mls_ext::wrap_welcome;
     use crate::groups::test::NoopValidator;
     use crate::test::mock::*;
@@ -381,6 +389,7 @@ mod tests {
     use xmtp_db::refresh_state::EntityKind;
     use xmtp_db::sql_key_store::SqlKeyStore;
     use xmtp_db::{MemoryStorage, mock::MockDbQuery, sql_key_store::mock::MockSqlKeyStore};
+    use xmtp_id::key_package::WrapperAlgorithm;
     use xmtp_proto::mls_v1::WelcomeMetadata;
     use xmtp_proto::types::{Cursor, WelcomeMessage, WelcomeMessageType, WelcomeMessageV1};
 

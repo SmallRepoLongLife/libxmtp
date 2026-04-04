@@ -1,21 +1,8 @@
 use crate::{
-    groups::welcome_sync::GroupSyncSummary,
-    identity_updates::{batch_get_association_state_with_verifier, get_creation_signature_kind},
-    messages::{
-        decoded_message::DecodedMessage,
-        enrichment::{EnrichMessageError, enrich_messages},
-    },
-};
-use xmtp_configuration::{CREATE_PQ_KEY_PACKAGE_EXTENSION, KEY_PACKAGE_ROTATION_INTERVAL_NS};
-use xmtp_macro::log_event;
-
-use crate::{
-    builder::SyncWorkerMode,
+    builder::DeviceSyncMode,
     context::XmtpSharedContext,
     groups::{
-        ConversationListItem, GroupError, MlsGroup,
-        device_sync::{DeviceSyncClient, preference_sync::PreferenceUpdate, worker::SyncMetric},
-        group_permissions::PolicySet,
+        ConversationListItem, GroupError, MlsGroup, group_permissions::PolicySet,
         welcome_sync::WelcomeService,
     },
     identity::{Identity, IdentityError, parse_credential},
@@ -23,15 +10,27 @@ use crate::{
     mls_store::{MlsStore, MlsStoreError},
     subscriptions::{LocalEventError, LocalEvents, SyncWorkerEvent},
     utils::VersionInfo,
-    verified_key_package_v2::{KeyPackageVerificationError, VerifiedKeyPackageV2},
+    worker::device_sync::{
+        DeviceSyncClient, preference_sync::PreferenceUpdate, worker::SyncMetric,
+    },
     worker::{WorkerRunner, metrics::WorkerMetrics},
 };
+use crate::{
+    groups::welcome_sync::GroupSyncSummary,
+    identity_updates::{batch_get_association_state_with_verifier, get_creation_signature_kind},
+    messages::{
+        decoded_message::DecodedMessage,
+        enrichment::{EnrichMessageError, enrich_messages},
+    },
+};
+use itertools::Itertools;
 use openmls::prelude::tls_codec::Error as TlsCodecError;
 use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use xmtp_api::{ApiClientWrapper, XmtpApi};
 use xmtp_common::{ErrorCode, Event, Retry, retry_async, retryable};
+use xmtp_configuration::{CREATE_PQ_KEY_PACKAGE_EXTENSION, KEY_PACKAGE_ROTATION_INTERVAL_NS};
 use xmtp_cryptography::signature::IdentifierValidationError;
 use xmtp_db::{
     ConnectionExt, NotFound, StorageError, XmtpDb,
@@ -41,8 +40,10 @@ use xmtp_db::{
     group::{ConversationType, GroupMembershipState, GroupQueryArgs},
     group_message::StoredGroupMessage,
     identity::StoredIdentity,
+    identity_cache::StoredIdentityKind,
 };
 use xmtp_db::{group::GroupQueryOrderBy, prelude::*};
+use xmtp_id::key_package::{KeyPackageVerificationError, VerifiedKeyPackageV2};
 use xmtp_id::{
     AsIdRef, InboxId, InboxIdRef,
     associations::{
@@ -51,16 +52,18 @@ use xmtp_id::{
     },
     scw_verifier::SmartContractSignatureVerifier,
 };
+use xmtp_macro::log_event;
 use xmtp_mls_common::{
     group::{DMMetadataOptions, GroupMetadataOptions},
     group_metadata::DmMembers,
     group_mutable_metadata::MessageDisappearingSettings,
 };
-use xmtp_proto::types::InstallationId;
 use xmtp_proto::{
+    ConversionError,
     api::HasStats,
     api_client::{ApiStats, IdentityStats},
 };
+use xmtp_proto::{types::InstallationId, xmtp::identity::associations::IdentifierKind};
 
 /// Enum representing the network the Client is connected to
 #[derive(Clone, Copy, Default, Debug)]
@@ -76,41 +79,97 @@ pub enum ClientError {
     #[error(transparent)]
     #[error_code(inherit)]
     AddressValidation(#[from] IdentifierValidationError),
+    /// Could not publish.
+    ///
+    /// Failed to publish messages to the network. May be retryable.
     #[error("could not publish: {0}")]
     PublishError(String),
+    /// Storage error.
+    ///
+    /// Database operation failed. May be retryable.
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
+    /// API error.
+    ///
+    /// Network request to XMTP backend failed. Retryable.
     #[error("API error: {0}")]
     Api(#[from] xmtp_api::ApiError),
+    /// Identity error.
+    ///
+    /// Problem with identity operations. Not retryable.
     #[error("identity error: {0}")]
     Identity(#[from] crate::identity::IdentityError),
+    /// TLS Codec error.
+    ///
+    /// Encoding/decoding MLS TLS structures failed. Not retryable.
     #[error("TLS Codec error: {0}")]
     TlsError(#[from] TlsCodecError),
+    /// Key package verification failed.
+    ///
+    /// Invalid key package received from network. Not retryable.
     #[error("key package verification: {0}")]
     KeyPackageVerification(#[from] KeyPackageVerificationError),
+    /// Stream inconsistency.
+    ///
+    /// Message stream state became inconsistent. Not retryable.
     #[error("Stream inconsistency error: {0}")]
     StreamInconsistency(String),
+    /// Association error.
+    ///
+    /// Identity association operation failed. Not retryable.
     #[error("Association error: {0}")]
     Association(#[from] AssociationError),
+    /// Signature validation error.
+    ///
+    /// A signature failed verification. Not retryable.
     #[error("signature validation error: {0}")]
     SignatureValidation(#[from] SignatureError),
+    /// Identity update error.
+    ///
+    /// Failed to process identity update. Not retryable.
     #[error(transparent)]
     IdentityUpdate(#[from] IdentityUpdateError),
+    /// Signature request error.
+    ///
+    /// Failed to create/process signature request. Not retryable.
     #[error(transparent)]
     SignatureRequest(#[from] SignatureRequestError),
+    /// Group error.
+    ///
+    /// Group operation failed. May be retryable.
     // the box is to prevent infinite cycle between client and group errors
     #[error(transparent)]
     Group(Box<GroupError>),
+    /// Local event error.
+    ///
+    /// Failed to process local event. Not retryable.
     #[error(transparent)]
     LocalEvent(#[from] LocalEventError),
+    /// Database connection error.
+    ///
+    /// Connection to database failed. Retryable.
     #[error(transparent)]
     Db(#[from] xmtp_db::ConnectionError),
+    /// Generic error.
+    ///
+    /// Unclassified error. May be retryable.
     #[error("generic:{0}")]
     Generic(String),
+    /// MLS store error.
+    ///
+    /// OpenMLS key store operation failed. Not retryable.
     #[error(transparent)]
     MlsStore(#[from] MlsStoreError),
+    /// Message enrichment error.
+    ///
+    /// Failed to enrich message content. Not retryable.
     #[error(transparent)]
     EnrichMessage(#[from] EnrichMessageError),
+    /// Conversion Error
+    ///
+    /// Data type failed to convert. Not retryable.
+    #[error(transparent)]
+    Conversion(#[from] xmtp_proto::ConversionError),
 }
 
 impl ClientError {
@@ -162,14 +221,20 @@ impl From<&str> for ClientError {
 /// Clients manage access to the network, identity, and data store
 pub struct Client<Context> {
     pub context: Context,
+    pub installation_id: InstallationId,
     pub(crate) local_events: broadcast::Sender<LocalEvents>,
     pub(crate) workers: Arc<WorkerRunner>,
 }
 
+impl<Context> Drop for Client<Context> {
+    fn drop(&mut self) {
+        log_event!(Event::ClientDropped, self.installation_id);
+    }
+}
+
 #[derive(Clone)]
 pub struct DeviceSync {
-    pub(crate) server_url: Option<String>,
-    pub(crate) mode: SyncWorkerMode,
+    pub(crate) mode: DeviceSyncMode,
 }
 
 // most of these things are `Arc`'s
@@ -177,6 +242,7 @@ impl<Context: Clone> Clone for Client<Context> {
     fn clone(&self) -> Self {
         Self {
             context: self.context.clone(),
+            installation_id: self.installation_id,
             local_events: self.local_events.clone(),
             workers: self.workers.clone(),
         }
@@ -287,14 +353,6 @@ where
         log_event!(Event::AssociateName, self.context.installation_id(), name);
     }
 
-    pub fn device_sync_server_url(&self) -> Option<&String> {
-        self.context.device_sync_server_url()
-    }
-
-    pub fn device_sync_worker_enabled(&self) -> bool {
-        self.context.device_sync_worker_enabled()
-    }
-
     pub fn device_sync_client(&self) -> DeviceSyncClient<Context> {
         let metrics = self.context.sync_metrics();
         DeviceSyncClient::new(
@@ -322,7 +380,16 @@ where
         conn: &impl DbQuery,
         identifiers: &[Identifier],
     ) -> Result<Vec<Option<String>>, ClientError> {
-        let mut cached_inbox_ids = conn.fetch_cached_inbox_ids(identifiers)?;
+        let ids: Vec<(String, StoredIdentityKind)> = identifiers
+            .iter()
+            .map(|i| {
+                Ok::<_, ConversionError>((
+                    i.clone().to_string(),
+                    StoredIdentityKind::try_from(IdentifierKind::from(i))?,
+                ))
+            })
+            .try_collect()?;
+        let mut cached_inbox_ids = conn.fetch_cached_inbox_ids(&ids)?;
         let mut new_inbox_ids = HashMap::default();
 
         let missing: Vec<_> = identifiers
@@ -1097,9 +1164,6 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests {
-    #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
-
     use super::Client;
     use crate::context::XmtpSharedContext;
     use crate::groups::send_message_opts::SendMessageOpts;
@@ -1129,11 +1193,9 @@ pub(crate) mod tests {
 
     #[xmtp_common::test]
     async fn test_group_member_recovery() {
-        let amal = ClientBuilder::new_test_client(&generate_local_wallet()).await;
-        let bola_wallet = generate_local_wallet();
-        // Add two separate installations for Bola
-        let bola_a = ClientBuilder::new_test_client(&bola_wallet).await;
-        let bola_b = ClientBuilder::new_test_client(&bola_wallet).await;
+        tester!(amal);
+        tester!(bola_a);
+        tester!(bola_b, from: bola_a);
 
         let group = amal.create_group(None, None).unwrap();
 
@@ -1154,7 +1216,7 @@ pub(crate) mod tests {
 
     #[xmtp_common::test]
     async fn test_mls_error() {
-        let client = ClientBuilder::new_test_client(&generate_local_wallet()).await;
+        tester!(client);
         let result = client
             .context
             .api()
@@ -1168,9 +1230,8 @@ pub(crate) mod tests {
 
     #[xmtp_common::test]
     async fn test_register_installation() {
-        let wallet = generate_local_wallet();
-        let client = ClientBuilder::new_test_client(&wallet).await;
-        let client_2 = ClientBuilder::new_test_client(&generate_local_wallet()).await;
+        tester!(client);
+        tester!(client_2);
         // Make sure the installation is actually on the network
         let association_state = client_2
             .identity_updates()
@@ -1187,8 +1248,7 @@ pub(crate) mod tests {
         tokio::test(flavor = "multi_thread", worker_threads = 1)
     )]
     async fn test_rotate_key_package() {
-        let wallet = generate_local_wallet();
-        let client = ClientBuilder::new_test_client(&wallet).await;
+        tester!(client);
 
         let installation_public_key = client.installation_public_key().to_vec();
         // Get original KeyPackage.
@@ -1222,7 +1282,7 @@ pub(crate) mod tests {
 
     #[xmtp_common::test]
     async fn test_find_groups() {
-        let client = ClientBuilder::new_test_client(&generate_local_wallet()).await;
+        tester!(client);
         let group_1 = client.create_group(None, None).unwrap();
         let group_2 = client.create_group(None, None).unwrap();
 
@@ -1234,11 +1294,10 @@ pub(crate) mod tests {
 
     #[xmtp_common::test]
     async fn test_find_inbox_id() {
-        let wallet = generate_local_wallet();
-        let client = ClientBuilder::new_test_client(&wallet).await;
+        tester!(client);
         assert_eq!(
             client
-                .find_inbox_id_from_identifier(&client.context.db(), wallet.identifier())
+                .find_inbox_id_from_identifier(&client.context.db(), client.identifier())
                 .await
                 .unwrap(),
             Some(client.inbox_id().to_string())
@@ -1334,11 +1393,11 @@ pub(crate) mod tests {
         use crate::utils::test_mocks_helpers::set_test_mode_limit_key_package_lifetime;
 
         // Create a client with default KP lifetime
-        let alice = ClientBuilder::new_test_client(&generate_local_wallet()).await;
+        tester!(alice);
 
         // Create a client with default KP lifetime
         set_test_mode_limit_key_package_lifetime(false, 0);
-        let cat = ClientBuilder::new_test_client(&generate_local_wallet()).await;
+        tester!(cat);
 
         let alice_bob_group = alice.create_group(None, None).unwrap();
         alice_bob_group
@@ -1355,7 +1414,7 @@ pub(crate) mod tests {
 
         // Create a client with a KP that expires in 5 seconds
         set_test_mode_limit_key_package_lifetime(true, 5);
-        let bob = ClientBuilder::new_test_client(&generate_local_wallet()).await;
+        tester!(bob);
 
         // Alice invites Bob with short living KP
         alice_bob_group
@@ -1381,7 +1440,7 @@ pub(crate) mod tests {
         assert_eq!(cat_duplicate_received_groups.len(), 0);
 
         set_test_mode_limit_key_package_lifetime(false, 0);
-        let dave = ClientBuilder::new_test_client(&generate_local_wallet()).await;
+        tester!(dave);
         alice_bob_group
             .add_members(&[dave.inbox_id()])
             .await
@@ -1405,8 +1464,8 @@ pub(crate) mod tests {
     #[rstest::rstest]
     #[xmtp_common::test(flavor = "multi_thread", worker_threads = 10)]
     async fn test_sync_all_groups() {
-        let alix = ClientBuilder::new_test_client(&generate_local_wallet()).await;
-        let bo = ClientBuilder::new_test_client(&generate_local_wallet()).await;
+        tester!(alix);
+        tester!(bo);
 
         let alix_bo_group1 = alix.create_group(None, None).unwrap();
         let alix_bo_group2 = alix.create_group(None, None).unwrap();
@@ -1887,10 +1946,10 @@ pub(crate) mod tests {
         assert_eq!(item[0].state, ConsentState::Allowed);
     }
 
+    #[xmtp_common::timeout(Duration::from_secs(50))]
     #[rstest::rstest]
     #[xmtp_common::test(unwrap_try = true)]
     // Set to 50 seconds to safely account for the 16 second keepalive interval and 10 second timeout
-    #[timeout(Duration::from_secs(50))]
     #[cfg_attr(any(target_arch = "wasm32"), ignore)]
     async fn should_reconnect() {
         toxiproxy_test(async || {
@@ -2025,8 +2084,8 @@ pub(crate) mod tests {
 
     #[xmtp_common::test]
     async fn test_delete_message() {
-        let alix = ClientBuilder::new_test_client(&generate_local_wallet()).await;
-        let bo = ClientBuilder::new_test_client(&generate_local_wallet()).await;
+        tester!(alix);
+        tester!(bo);
 
         // Create a group with both users
         let group = alix

@@ -1,9 +1,11 @@
 [package]
 name = "xmtp_common"
-edition = "2024"
-version.workspace = true
-license.workspace = true
 description = "common utilities"
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true
@@ -12,7 +14,7 @@ futures = { workspace = true, features = ["std"] }
 hex.workspace = true
 rand.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time", "rt"] }
+tokio.workspace = true
 tracing.workspace = true
 web-time.workspace = true
 
@@ -30,7 +32,7 @@ tracing-subscriber = { workspace = true, features = [
   "json",
 ], optional = true }
 wasm-bindgen-test = { workspace = true, optional = true }
-xmtp-workspace-hack = { version = "0.1", path = "../xmtp-workspace-hack" }
+xmtp-workspace-hack.workspace = true
 xmtp_cryptography.workspace = true
 xmtp_macro.workspace = true
 
@@ -43,8 +45,7 @@ js-sys.workspace = true
 web-sys = { workspace = true, features = ["Window"] }
 wasm-bindgen-futures.workspace = true
 wasm-bindgen.workspace = true
-tokio = { workspace = true, features = ["time", "sync"] }
-tokio_with_wasm = { version = "0.8.7", features = ["full"] }
+tokio_with_wasm = { version = "0.9.0", features = ["full"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio-stream = { workspace = true, features = ["time"] }
@@ -56,7 +57,7 @@ once_cell.workspace = true
 owo-colors.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
-toxiproxy_rust = { workspace = true }
+toxiproxy_rust.workspace = true
 tracing-subscriber = { workspace = true, features = [
   "fmt",
   "env-filter",
@@ -68,20 +69,15 @@ xmtp_cryptography = { workspace = true, features = ["test-utils"] }
 
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-tokio = { workspace = true, features = ["time", "macros", "rt", "sync"] }
+tokio = { workspace = true }
 wasm-bindgen-test.workspace = true
 tracing-wasm = { version = "0.2" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tokio = { workspace = true, features = [
-  "time",
-  "macros",
-  "rt-multi-thread",
-  "sync",
-] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing-forest.workspace = true
 ctor.workspace = true
-parking_lot = { workspace = true }
+parking_lot.workspace = true
 
 [features]
 logging = ["dep:tracing-subscriber"]

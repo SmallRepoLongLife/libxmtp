@@ -95,10 +95,26 @@ framework: lipo
 		-output build/swift/LibXMTPSwiftFFI.xcframework
 	cp -f $(SWIFT_OUT)/xmtpv3.swift $(IOS_SDK_SWIFT_DIR)/xmtpv3.swift
 
+# Fast xcframework: simulator + macOS only, no lipo needed (single arch each), static only.
+# Used by sdks/ios/dev/bindings (default) for fast local dev builds.
+framework-fast:
+	mkdir -p build/swift
+	mkdir -p $(IOS_SDK_SWIFT_DIR)
+	chmod -R u+w build/swift/LibXMTPSwiftFFI.xcframework 2>/dev/null || true
+	rm -rf build/swift/LibXMTPSwiftFFI.xcframework
+	xcodebuild -create-xcframework \
+		-library $(NIX_OUT)/aarch64-apple-ios-sim/$(LIB) \
+		-headers $(SWIFT_OUT)/include/libxmtp/ \
+		-library $(NIX_OUT)/aarch64-apple-darwin/$(LIB) \
+		-headers $(SWIFT_OUT)/include/libxmtp/ \
+		-output build/swift/LibXMTPSwiftFFI.xcframework
+	cp -f $(SWIFT_OUT)/xmtpv3.swift $(IOS_SDK_SWIFT_DIR)/xmtpv3.swift
+
 frameworkdyn: lipodyn
 	mkdir -p build/swift
 	chmod -R u+w build/swift/LibXMTPSwiftFFIDynamic.xcframework 2>/dev/null || true
 	rm -rf build/swift/LibXMTPSwiftFFIDynamic.xcframework
+	install_name_tool -id @rpath/libxmtpv3.dylib $(NIX_OUT)/aarch64-apple-ios/$(DYLIB)
 	xcodebuild -create-xcframework \
 		-library $(NIX_OUT)/aarch64-apple-ios/$(DYLIB) \
 		-headers $(SWIFT_OUT)/include/libxmtp/ \
@@ -135,4 +151,4 @@ local: NIX_OUT = build
 local: SWIFT_OUT = build/swift/static
 local: $(ARCHS_IOS) $(ARCHS_MAC) aarch64-apple-ios bindgenstatic swift lipo framework lipodyn frameworkdyn
 
-.PHONY: $(ARCHS_IOS) $(ARCHS_MAC) framework all aarch64-apple-ios install-jar echo-jar download-toolchains swift bindgenstatic frameworkdyn lipo lipodyn local
+.PHONY: $(ARCHS_IOS) $(ARCHS_MAC) framework framework-fast all aarch64-apple-ios install-jar echo-jar download-toolchains swift bindgenstatic frameworkdyn lipo lipodyn local

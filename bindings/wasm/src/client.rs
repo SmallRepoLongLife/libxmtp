@@ -10,15 +10,16 @@ use tracing_subscriber::{filter, fmt::format::Pretty};
 use tsify::Tsify;
 use wasm_bindgen::{JsValue, prelude::*};
 use xmtp_api_d14n::MessageBackendBuilder;
-use xmtp_db::{EncryptedMessageStore, EncryptionKey, StorageOption, WasmDb};
+use xmtp_db::{EncryptedMessageStore, StorageOption, WasmDb};
 use xmtp_id::associations::Identifier as XmtpIdentifier;
 use xmtp_mls::Client as MlsClient;
-use xmtp_mls::builder::SyncWorkerMode;
+use xmtp_mls::builder::DeviceSyncMode as XmtpDeviceSyncMode;
 use xmtp_mls::cursor_store::SqliteCursorStore;
 use xmtp_mls::groups::MlsGroup;
 use xmtp_mls::identity::IdentityStrategy;
 use xmtp_proto::api_client::AggregateStats;
 
+use crate::ErrorWrapper;
 use crate::conversations::Conversations;
 use crate::device_sync::DeviceSync;
 use crate::identity::{ApiStats, Identifier, IdentityStats};
@@ -27,6 +28,7 @@ use crate::inbox_state::InboxState;
 pub type RustXmtpClient = MlsClient<xmtp_mls::MlsContext>;
 pub type RustMlsGroup = MlsGroup<xmtp_mls::MlsContext>;
 
+pub mod backend;
 pub mod gateway_auth;
 
 #[wasm_bindgen]
@@ -69,16 +71,16 @@ impl LogLevel {
 }
 
 #[wasm_bindgen_numbered_enum]
-pub enum DeviceSyncWorkerMode {
+pub enum DeviceSyncMode {
   Enabled = 0,
   Disabled = 1,
 }
 
-impl From<DeviceSyncWorkerMode> for SyncWorkerMode {
-  fn from(value: DeviceSyncWorkerMode) -> Self {
+impl From<DeviceSyncMode> for XmtpDeviceSyncMode {
+  fn from(value: DeviceSyncMode) -> Self {
     match value {
-      DeviceSyncWorkerMode::Enabled => Self::Enabled,
-      DeviceSyncWorkerMode::Disabled => Self::Disabled,
+      DeviceSyncMode::Enabled => Self::Enabled,
+      DeviceSyncMode::Disabled => Self::Disabled,
     }
   }
 }
@@ -89,6 +91,31 @@ pub enum ClientMode {
   #[default]
   Default = 0,
   Notification = 1,
+}
+
+#[wasm_bindgen_numbered_enum]
+pub enum XmtpEnv {
+  Local = 0,
+  Dev = 1,
+  Production = 2,
+  TestnetStaging = 3,
+  TestnetDev = 4,
+  Testnet = 5,
+  Mainnet = 6,
+}
+
+impl From<XmtpEnv> for xmtp_configuration::XmtpEnv {
+  fn from(env: XmtpEnv) -> Self {
+    match env {
+      XmtpEnv::Local => Self::Local,
+      XmtpEnv::Dev => Self::Dev,
+      XmtpEnv::Production => Self::Production,
+      XmtpEnv::TestnetStaging => Self::TestnetStaging,
+      XmtpEnv::TestnetDev => Self::TestnetDev,
+      XmtpEnv::Testnet => Self::Testnet,
+      XmtpEnv::Mainnet => Self::Mainnet,
+    }
+  }
 }
 
 /// Specify options for the logger
@@ -145,8 +172,12 @@ fn init_logging(options: LogOptions) -> Result<(), JsError> {
           .with_level(true)
           .without_time() // need to test whether this would break browsers
           .with_target(true);
-
-        tracing_subscriber::registry().with(filter).with(fmt).init();
+        
+        // Initialize tracing subscriber. Silently ignored if already set by another crate.
+        let subscriber_result = tracing_subscriber::registry().with(filter).with(fmt).try_init();
+        if subscriber_result.is_err() {
+          tracing::warn!("tracing subscriber has not been initialized. Maybe it is already set? Error: {:?}", subscriber_result.err());
+        }
       } else {
         let fmt = tracing_subscriber::fmt::layer()
           .with_ansi(false) // not supported by all browsers
@@ -156,11 +187,19 @@ fn init_logging(options: LogOptions) -> Result<(), JsError> {
         let subscriber = tracing_subscriber::registry().with(fmt).with(filter);
 
         if options.performance.unwrap_or_default() {
-          subscriber
+          // Initialize tracing subscriber. Silently ignored if already set by another crate.
+          let subscriber_result = subscriber
             .with(tracing_web::performance_layer().with_details_from_fields(Pretty::default()))
-            .init();
+            .try_init();
+          if subscriber_result.is_err() {
+            tracing::warn!("Tracing subscriber has not been initialized. Maybe it is already set? Error: {:?}", subscriber_result.err());
+          }
         } else {
-          subscriber.init();
+          // Initialize tracing subscriber. Silently ignored if already set by another crate.
+          let subscriber_result = subscriber.try_init();
+          if subscriber_result.is_err() {
+            tracing::warn!("Tracing subscriber has not been initialized. Maybe it is already set? Error: {:?}", subscriber_result.err());
+          }
         }
       }
       Ok(())
@@ -169,82 +208,42 @@ fn init_logging(options: LogOptions) -> Result<(), JsError> {
   Ok(())
 }
 
-#[wasm_bindgen(js_name = createClient)]
-#[allow(clippy::too_many_arguments)]
-pub async fn create_client(
-  host: String,
-  #[wasm_bindgen(js_name = inboxId)] inbox_id: String,
-  #[wasm_bindgen(js_name = accountIdentifier)] account_identifier: Identifier,
-  #[wasm_bindgen(js_name = dbPath)] db_path: Option<String>,
-  #[wasm_bindgen(js_name = encryptionKey)] encryption_key: Option<Uint8Array>,
-  #[wasm_bindgen(js_name = deviceSyncServerUrl)] device_sync_server_url: Option<String>,
-  #[wasm_bindgen(js_name = deviceSyncWorkerMode)] device_sync_worker_mode: Option<
-    DeviceSyncWorkerMode,
-  >,
-  #[wasm_bindgen(js_name = logOptions)] log_options: Option<LogOptions>,
-  #[wasm_bindgen(js_name = allowOffline)] allow_offline: Option<bool>,
-  #[wasm_bindgen(js_name = appVersion)] app_version: Option<String>,
-  #[wasm_bindgen(js_name = gatewayHost)] gateway_host: Option<String>,
-  nonce: Option<u64>,
-  #[wasm_bindgen(js_name = authCallback)] auth_callback: Option<gateway_auth::AuthCallback>,
-  #[wasm_bindgen(js_name = authHandle)] auth_handle: Option<gateway_auth::AuthHandle>,
-  #[wasm_bindgen(js_name = clientMode)] client_mode: Option<ClientMode>,
-) -> Result<Client, JsError> {
-  init_logging(log_options.unwrap_or_default())?;
-  tracing::info!(host, gateway_host, "Creating client in rust");
-
-  let client_mode = client_mode.unwrap_or_default();
-
-  let mut backend = MessageBackendBuilder::default();
-  let is_secure =
-    host.starts_with("https") && gateway_host.as_ref().is_none_or(|h| h.starts_with("https"));
-  backend
-    .v3_host(&host)
-    .maybe_gateway_host(gateway_host)
-    .app_version(app_version.clone().unwrap_or_default())
-    .is_secure(is_secure)
-    .readonly(matches!(client_mode, ClientMode::Notification))
-    .maybe_auth_callback(auth_callback.map(|c| Arc::new(c) as _))
-    .maybe_auth_handle(auth_handle.map(|h| h.handle));
-
+pub(crate) async fn build_store(
+  db_path: Option<String>,
+  encryption_key: Option<Uint8Array>,
+) -> Result<EncryptedMessageStore<WasmDb>, JsError> {
   let storage_option = match db_path {
     Some(path) => StorageOption::Persistent(path),
     None => StorageOption::Ephemeral,
   };
 
-  let store = match encryption_key {
-    Some(key) => {
-      let key: Vec<u8> = key.to_vec();
-      let _key: EncryptionKey = key
-        .try_into()
-        .map_err(|_| JsError::new("Malformed 32 byte encryption key"))?;
-      let db = WasmDb::new(&storage_option).await?;
-      EncryptedMessageStore::new(db)
-        .map_err(|e| JsError::new(&format!("Error creating encrypted message store {e}")))?
-    }
-    None => {
-      let db = WasmDb::new(&storage_option).await?;
-      EncryptedMessageStore::new(db)
-        .map_err(|e| JsError::new(&format!("Error creating unencrypted message store {e}")))?
-    }
-  };
+  if encryption_key.is_some() {
+    tracing::warn!("encryption_key is not supported in WASM and will be ignored");
+  }
 
+  let db = WasmDb::new(&storage_option).await?;
+  EncryptedMessageStore::new(db)
+    .map_err(|e| JsError::new(&format!("Error creating message store {e}")))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_client_inner(
+  api_client: xmtp_mls::XmtpApiClient,
+  sync_api_client: xmtp_mls::XmtpApiClient,
+  store: EncryptedMessageStore<WasmDb>,
+  inbox_id: String,
+  account_identifier: Identifier,
+  device_sync_worker_mode: Option<DeviceSyncMode>,
+  allow_offline: Option<bool>,
+  app_version: Option<String>,
+  nonce: u64,
+) -> Result<Client, JsError> {
   let identity_strategy = IdentityStrategy::new(
-    inbox_id.clone(),
+    inbox_id,
     account_identifier.clone().try_into()?,
-    nonce.unwrap_or(1),
+    nonce,
     None,
   );
-
-  backend.cursor_store(SqliteCursorStore::new(store.db()));
-  let api_client = backend
-    .clone()
-    .build()
-    .map_err(|e| JsError::new(&e.to_string()))?;
-  let sync_api_client = backend
-    .clone()
-    .build()
-    .map_err(|e| JsError::new(&e.to_string()))?;
 
   let mut builder = xmtp_mls::Client::builder(identity_strategy)
     .api_clients(api_client, sync_api_client)
@@ -253,10 +252,6 @@ pub async fn create_client(
     .with_remote_verifier()?
     .with_allow_offline(allow_offline)
     .store(store);
-
-  if let Some(u) = device_sync_server_url {
-    builder = builder.device_sync_server_url(&u);
-  };
 
   if let Some(device_sync_worker_mode) = device_sync_worker_mode {
     builder = builder.device_sync_worker_mode(device_sync_worker_mode.into());
@@ -274,6 +269,65 @@ pub async fn create_client(
     inner_client: Arc::new(xmtp_client),
     app_version,
   })
+}
+
+#[wasm_bindgen(js_name = createClient)]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_client(
+  host: String,
+  #[wasm_bindgen(js_name = inboxId)] inbox_id: String,
+  #[wasm_bindgen(js_name = accountIdentifier)] account_identifier: Identifier,
+  #[wasm_bindgen(js_name = dbPath)] db_path: Option<String>,
+  #[wasm_bindgen(js_name = encryptionKey)] encryption_key: Option<Uint8Array>,
+  #[wasm_bindgen(js_name = deviceSyncMode)] device_sync_worker_mode: Option<DeviceSyncMode>,
+  #[wasm_bindgen(js_name = logOptions)] log_options: Option<LogOptions>,
+  #[wasm_bindgen(js_name = allowOffline)] allow_offline: Option<bool>,
+  #[wasm_bindgen(js_name = appVersion)] app_version: Option<String>,
+  #[wasm_bindgen(js_name = gatewayHost)] gateway_host: Option<String>,
+  nonce: Option<u64>,
+  #[wasm_bindgen(js_name = authCallback)] auth_callback: Option<gateway_auth::AuthCallback>,
+  #[wasm_bindgen(js_name = authHandle)] auth_handle: Option<gateway_auth::AuthHandle>,
+  #[wasm_bindgen(js_name = clientMode)] client_mode: Option<ClientMode>,
+) -> Result<Client, JsError> {
+  init_logging(log_options.unwrap_or_default())?;
+  tracing::info!(host, gateway_host, "Creating client in rust");
+
+  let client_mode = client_mode.unwrap_or_default();
+
+  let mut backend = MessageBackendBuilder::default();
+  backend
+    .v3_host(&host)
+    .maybe_gateway_host(gateway_host)
+    .app_version(app_version.clone().unwrap_or_default())
+    .readonly(matches!(client_mode, ClientMode::Notification))
+    .maybe_auth_callback(auth_callback.map(|c| Arc::new(c) as _))
+    .maybe_auth_handle(auth_handle.map(|h| h.handle));
+
+  let store = build_store(db_path, encryption_key).await?;
+
+  let cursor_store = SqliteCursorStore::new(store.db());
+  backend.cursor_store(cursor_store);
+  let api_client = backend
+    .clone()
+    .build_optional_d14n()
+    .map_err(ErrorWrapper::js)?;
+  let sync_api_client = backend
+    .clone()
+    .build_optional_d14n()
+    .map_err(ErrorWrapper::js)?;
+
+  create_client_inner(
+    api_client,
+    sync_api_client,
+    store,
+    inbox_id,
+    account_identifier,
+    device_sync_worker_mode,
+    allow_offline,
+    app_version,
+    nonce.unwrap_or(1),
+  )
+  .await
 }
 
 #[wasm_bindgen]
@@ -330,7 +384,7 @@ impl Client {
       .inner_client
       .can_message(&account_identifiers)
       .await
-      .map_err(|e| JsError::new(format!("{}", e).as_str()))?;
+      .map_err(ErrorWrapper::js)?;
 
     let results: HashMap<_, _> = results
       .into_iter()
@@ -350,7 +404,7 @@ impl Client {
       .inner_client
       .find_inbox_id_from_identifier(&conn, identifier.try_into()?)
       .await
-      .map_err(|e| JsError::new(format!("{}", e).as_str()))?;
+      .map_err(ErrorWrapper::js)?;
 
     Ok(inbox_id)
   }
@@ -368,7 +422,7 @@ impl Client {
         inbox_ids.iter().map(String::as_str).collect(),
       )
       .await
-      .map_err(|e| JsError::new(format!("{}", e).as_str()))?;
+      .map_err(ErrorWrapper::js)?;
     Ok(state.into_iter().map(Into::into).collect())
   }
 
@@ -389,7 +443,7 @@ impl Client {
     let summary = inner
       .sync_all_welcomes_and_device_sync_groups()
       .await
-      .map_err(|e| JsError::new(&format!("{e}")))?;
+      .map_err(ErrorWrapper::js)?;
 
     Ok(summary.into())
   }

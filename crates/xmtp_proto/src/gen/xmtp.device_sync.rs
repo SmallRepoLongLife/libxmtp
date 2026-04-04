@@ -17,6 +17,7 @@ pub mod backup_element {
         GroupMessage(super::message_backup::GroupMessageSave),
         #[prost(message, tag = "4")]
         Consent(super::consent_backup::ConsentSave),
+        #[deprecated]
         #[prost(message, tag = "5")]
         Event(super::event_backup::EventSave),
     }
@@ -56,7 +57,7 @@ impl ::prost::Name for BackupMetadataSave {
 }
 /// Backup Options
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct BackupOptions {
+pub struct ArchiveOptions {
     #[prost(enumeration = "BackupElementSelection", repeated, tag = "1")]
     pub elements: ::prost::alloc::vec::Vec<i32>,
     #[prost(int64, optional, tag = "2")]
@@ -66,14 +67,14 @@ pub struct BackupOptions {
     #[prost(bool, tag = "4")]
     pub exclude_disappearing_messages: bool,
 }
-impl ::prost::Name for BackupOptions {
-    const NAME: &'static str = "BackupOptions";
+impl ::prost::Name for ArchiveOptions {
+    const NAME: &'static str = "ArchiveOptions";
     const PACKAGE: &'static str = "xmtp.device_sync";
     fn full_name() -> ::prost::alloc::string::String {
-        "xmtp.device_sync.BackupOptions".into()
+        "xmtp.device_sync.ArchiveOptions".into()
     }
     fn type_url() -> ::prost::alloc::string::String {
-        "/xmtp.device_sync.BackupOptions".into()
+        "/xmtp.device_sync.ArchiveOptions".into()
     }
 }
 /// Elements selected for backup
@@ -83,6 +84,7 @@ pub enum BackupElementSelection {
     Unspecified = 0,
     Messages = 1,
     Consent = 2,
+    #[deprecated]
     Event = 3,
 }
 impl BackupElementSelection {
@@ -95,6 +97,7 @@ impl BackupElementSelection {
             Self::Unspecified => "BACKUP_ELEMENT_SELECTION_UNSPECIFIED",
             Self::Messages => "BACKUP_ELEMENT_SELECTION_MESSAGES",
             Self::Consent => "BACKUP_ELEMENT_SELECTION_CONSENT",
+            #[allow(deprecated)]
             Self::Event => "BACKUP_ELEMENT_SELECTION_EVENT",
         }
     }
@@ -104,7 +107,7 @@ impl BackupElementSelection {
             "BACKUP_ELEMENT_SELECTION_UNSPECIFIED" => Some(Self::Unspecified),
             "BACKUP_ELEMENT_SELECTION_MESSAGES" => Some(Self::Messages),
             "BACKUP_ELEMENT_SELECTION_CONSENT" => Some(Self::Consent),
-            "BACKUP_ELEMENT_SELECTION_EVENT" => Some(Self::Event),
+            "BACKUP_ELEMENT_SELECTION_EVENT" => Some(#[allow(deprecated)] Self::Event),
             _ => None,
         }
     }

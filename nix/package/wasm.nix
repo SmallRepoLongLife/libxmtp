@@ -1,11 +1,8 @@
 {
   emscripten,
   lib,
-  fenix,
   wasm-pack,
   binaryen,
-  zstd,
-  zlib,
   mkShell,
   sqlite,
   llvmPackages,
@@ -15,34 +12,27 @@
   google-chrome,
   chromium,
   corepack,
-  pkg-config,
   cargo-nextest,
   stdenv,
+  test ? false,
 }:
 let
-  inherit (xmtp) craneLib;
-  # Pinned Rust Version
-  rust-toolchain = fenix.combine [
-    fenix.stable.cargo
-    fenix.stable.rustc
-    fenix.targets.wasm32-unknown-unknown.stable.rust-std
-  ];
+  inherit (xmtp) craneLib base;
+  # Pinned Rust Version (must use mkToolchain to match the rest of the project)
+  rust-toolchain =
+    xmtp.mkNativeToolchain
+      [ "wasm32-unknown-unknown" ]
+      [ "clippy-preview" "rustfmt-preview" ];
   rust = craneLib.overrideToolchain (p: rust-toolchain);
 
-  libraryFileset = lib.fileset.toSource {
-    root = ./../..;
-    fileset = xmtp.filesets.libraries;
-  };
-
+  features = if test then "--features test-utils" else "";
   bindingsFileset = lib.fileset.toSource {
     root = ./../..;
     fileset = xmtp.filesets.forCrate ./../../bindings/wasm;
   };
 
-  commonArgs = {
+  commonArgs = base.commonArgs // {
     meta.description = "WebAssembly Bindings";
-    src = libraryFileset;
-    strictDeps = true;
     # EM_CACHE = "$TMPDIR/.emscripten_cache";
     # we need to set tmpdir for emscripten cache
     preConfigure = ''
@@ -53,10 +43,7 @@ let
       # export EM_CACHE=$TMPDIR
       # export EMCC_DEBUG=2
     '';
-    nativeBuildInputs = [
-      zstd
-      zlib
-      pkg-config
+    nativeBuildInputs = base.commonArgs.nativeBuildInputs ++ [
       wasm-pack
       emscripten
       llvmPackages.lld
@@ -64,8 +51,6 @@ let
       wasm-bindgen-cli
     ];
     buildInputs = [ sqlite ];
-    doCheck = false;
-    cargoExtraArgs = "--workspace --exclude xmtpv3 --exclude bindings_node --exclude xmtp_cli --exclude xdbg --exclude mls_validation_service --exclude xmtp_api_grpc --exclude benches --exclude xmtp-db-tools";
     hardeningDisable = [
       "zerocallusedregs"
       "stackprotector"
@@ -74,19 +59,24 @@ let
 
   commonEnv = {
     CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
-    NIX_DEBUG = 1;
+    inherit (xmtp.shellCommon.wasmEnv)
+      CC_wasm32_unknown_unknown
+      AR_wasm32_unknown_unknown
+      CFLAGS_wasm32_unknown_unknown
+      ;
     # why CC manually (zstd): https://github.com/gyscos/zstd-rs/issues/339
-    CC_wasm32_unknown_unknown = "${llvmPackages.clang-unwrapped}/bin/clang";
-    AR_wasm32_unknown_unknown = "${llvmPackages.bintools-unwrapped}/bin/llvm-ar";
-    CFLAGS_wasm32_unknown_unknown = "-I ${llvmPackages.clang-unwrapped.lib}/lib/clang/21/include";
-    # SQLITE_WASM_RS_UPDATE_PREBUILD = 1;
   };
 
   # enables caching all build time crates
-  cargoArtifacts = rust.buildDepsOnly (commonEnv // commonArgs);
+  cargoArtifacts = rust.buildDepsOnly (
+    (base.commonArgs // commonEnv)
+    // {
+      buildPhaseCargoCommand = "cargo build --package bindings_wasm ${features} --profile $CARGO_PROFILE --locked";
+    }
+  );
 
   bin = rust.buildPackage (
-    (commonEnv // commonArgs)
+    (commonArgs // commonEnv)
     // {
       inherit cargoArtifacts;
       src = bindingsFileset;
@@ -96,26 +86,18 @@ let
         })
         pname
         ;
-      inherit
-        (rust.crateNameFromCargoToml {
-          cargoToml = ./../../Cargo.toml;
-        })
-        version
-        ;
+      version = xmtp.mkVersion rust;
       buildPhaseCargoCommand = ''
         mkdir -p $out/dist
         cargoBuildLog=$(mktemp cargoBuildLogXXXX.json)
 
-        HOME=$(mktemp -d fake-homeXXXX) wasm-pack --verbose build --target web --out-dir $out/dist --no-pack --release ./bindings/wasm -- --message-format json-render-diagnostics > "$cargoBuildLog"
+        HOME=$(mktemp -d fake-homeXXXX) wasm-pack \
+          --verbose build --target web --out-dir $out/dist \
+          --no-pack --release ./bindings/wasm -- \
+          ${features} --message-format json-render-diagnostics > "$cargoBuildLog"
       '';
-
     }
   );
-
-  # this allows re-using build artifacts
-  # nextest-libs = nextest "-E 'kind(lib)'";
-  # nextest-d14n = nextest "--features d14n -E 'kind(lib)'";
-  # nextest-integration = nextest "-E 'package(bindings_wasm)'";
 
   devShell = mkShell (
     commonEnv
@@ -123,29 +105,30 @@ let
       inputsFrom = [ commonArgs ];
       buildInputs = [
         rust-toolchain
+        cargo-nextest
         chromedriver
         corepack
-        cargo-nextest
       ]
       # chromium unsupported on darwin
       # google-chrome unsupported on aarch64-linux
       # Firefox compiles from scratch on everything but x86_64 (unreliable build)
       ++ lib.optionals stdenv.isDarwin [ google-chrome ]
       ++ lib.optionals stdenv.isLinux [ chromium ];
+      inherit (xmtp.shellCommon.wasmEnv)
+        RSTEST_TIMEOUT
+        WASM_BINDGEN_TEST_TIMEOUT
+        WASM_BINDGEN_TEST_WEBDRIVER_JSON
+        CHROMEDRIVER
+        ;
 
       SQLITE = "${sqlite.dev}";
       SQLITE_OUT = "${sqlite.out}";
-      CHROMEDRIVER = "${lib.getBin chromedriver}/bin/chromedriver";
-      WASM_BINDGEN_TEST_TIMEOUT = 1024;
-      WASM_BINDGEN_TEST_ONLY_WEB = 1;
-      RSTEST_TIMEOUT = 90;
       CARGO_PROFILE_TEST_DEBUG = 0;
-      WASM_BINDGEN_TEST_WEBDRIVER_JSON = ./../../webdriver.json;
       CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
       XMTP_NIX_ENV = 1;
     }
   );
 in
 {
-  inherit bin devShell;
+  inherit devShell bin;
 }

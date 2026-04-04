@@ -106,18 +106,10 @@ pub struct TestCursorStore {
 }
 
 impl CursorStore for TestCursorStore {
-    fn lowest_common_cursor(&self, _: &[&Topic]) -> Result<GlobalCursor, CursorStoreError> {
-        unreachable!()
-    }
-
-    fn latest(&self, _: &Topic) -> Result<GlobalCursor, CursorStoreError> {
-        unreachable!()
-    }
-
-    fn latest_per_originator(
+    fn latest(
         &self,
         _: &Topic,
-        _: &[&OriginatorId],
+        _: Option<&[&OriginatorId]>,
     ) -> Result<GlobalCursor, CursorStoreError> {
         unreachable!()
     }
@@ -126,10 +118,6 @@ impl CursorStore for TestCursorStore {
         &self,
         _: &mut dyn Iterator<Item = &Topic>,
     ) -> Result<HashMap<Topic, GlobalCursor>, CursorStoreError> {
-        unreachable!()
-    }
-
-    fn lcc_maybe_missing(&self, _: &[&Topic]) -> Result<GlobalCursor, CursorStoreError> {
         unreachable!()
     }
 
@@ -152,5 +140,29 @@ impl CursorStore for TestCursorStore {
         _cursors: &[Cursor],
     ) -> Result<Vec<xmtp_proto::types::OrphanedEnvelope>, CursorStoreError> {
         unreachable!()
+    }
+
+    fn set_cutover_ns(&self, _cutover_ns: i64) -> Result<(), CursorStoreError> {
+        Ok(())
+    }
+
+    fn get_cutover_ns(&self) -> Result<i64, CursorStoreError> {
+        Ok(i64::MAX)
+    }
+
+    fn get_last_checked_ns(&self) -> Result<i64, CursorStoreError> {
+        Ok(0)
+    }
+
+    fn set_last_checked_ns(&self, _last_checked_ns: i64) -> Result<(), CursorStoreError> {
+        Ok(())
+    }
+
+    fn has_migrated(&self) -> Result<bool, CursorStoreError> {
+        Ok(false)
+    }
+
+    fn set_has_migrated(&self, _has_migrated: bool) -> Result<(), CursorStoreError> {
+        Ok(())
     }
 }

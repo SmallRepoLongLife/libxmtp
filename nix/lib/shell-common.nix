@@ -8,6 +8,7 @@
   sqlite,
   zstd,
   zlib,
+  fontconfig,
   llvmPackages,
   wasm-bindgen-cli,
   wasm-pack,
@@ -32,19 +33,46 @@
   flamegraph,
   cargo-flamegraph,
   inferno,
+  gh,
   jq,
   curl,
   graphite-cli,
   toxiproxy,
-  omnix,
   rr,
+  markdownlint-cli,
+  chromedriver,
+  google-chrome,
+  chromium,
+  writeText,
+  xmtp,
 }:
 let
-  inherit (stdenv) isDarwin isLinux;
+  inherit (stdenv) isLinux;
+
+  # Pin Chrome binary to the Nix-provided version so ChromeDriver never
+  # discovers a system-installed Chrome with a different major version.
+  chromeBin =
+    if stdenv.isDarwin then
+      "${lib.getBin google-chrome}/bin/google-chrome-stable"
+    else
+      "${lib.getBin chromium}/bin/chromium";
+
+  # Read the base webdriver.json and inject the Nix Chrome binary path.
+  baseWebdriver = builtins.fromJSON (builtins.readFile ./../../webdriver.json);
+  webdriverJson = writeText "webdriver.json" (
+    builtins.toJSON (
+      baseWebdriver
+      // {
+        "goog:chromeOptions" = baseWebdriver."goog:chromeOptions" // {
+          binary = chromeBin;
+        };
+      }
+    )
+  );
 in
 {
   # Core Rust build environment: env vars, hardening, native deps, LD_LIBRARY_PATH
-  rustBase = {
+  rustBase = xmtp.base.commonArgs // {
     env = {
       OPENSSL_DIR = "${openssl.dev}";
       OPENSSL_LIB_DIR = "${lib.getLib openssl}/lib";
@@ -56,16 +84,8 @@ in
       "zerocallusedregs"
       "stackprotector"
     ];
-    nativeBuildInputs = [
-      pkg-config
-      zstd
-      openssl
-      zlib
-    ];
-    buildInputs = [
-      openssl
-      sqlite
-      zstd
+    nativeBuildInputs = xmtp.base.commonArgs.nativeBuildInputs ++ [
+      fontconfig
     ];
     LD_LIBRARY_PATH = lib.makeLibraryPath [
       openssl
@@ -78,6 +98,10 @@ in
     CC_wasm32_unknown_unknown = "${llvmPackages.clang-unwrapped}/bin/clang";
     AR_wasm32_unknown_unknown = "${llvmPackages.bintools-unwrapped}/bin/llvm-ar";
     CFLAGS_wasm32_unknown_unknown = "-I ${llvmPackages.clang-unwrapped.lib}/lib/clang/21/include";
+    WASM_BINDGEN_TEST_TIMEOUT = 1024;
+    RSTEST_TIMEOUT = 90;
+    WASM_BINDGEN_TEST_WEBDRIVER_JSON = webdriverJson;
+    CHROMEDRIVER = "${lib.getBin chromedriver}/bin/chromedriver";
   };
 
   # WASM tooling
@@ -86,8 +110,14 @@ in
     wasm-pack
     binaryen
     emscripten
+    chromedriver
     wasm-tools
-  ];
+  ]
+  # chromium unsupported on darwin
+  # google-chrome unsupported on aarch64-linux
+  # Firefox compiles from scratch on everything but x86_64 (unreliable build)
+  ++ lib.optionals stdenv.isDarwin [ google-chrome ]
+  ++ lib.optionals stdenv.isLinux [ chromium ];
 
   # Cargo workflow tools
   cargoTools = [
@@ -108,6 +138,7 @@ in
     buf
     protobuf
     protolint
+    markdownlint-cli
   ];
 
   # Lint tools
@@ -130,10 +161,10 @@ in
 
   # Miscellaneous dev convenience tools
   miscDevTools = [
+    gh
     jq
     curl
     graphite-cli
     toxiproxy
-    omnix
   ];
 }

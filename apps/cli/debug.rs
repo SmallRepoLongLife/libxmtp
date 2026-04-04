@@ -1,13 +1,13 @@
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use openmls::prelude::ProtocolMessage;
-use openmls::prelude::{tls_codec::Deserialize, MlsMessageBodyIn, MlsMessageIn, OpenMlsProvider};
+use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn, OpenMlsProvider, tls_codec::Deserialize};
 use std::collections::HashMap;
 use xmtp_api::GetIdentityUpdatesV2Filter;
-use xmtp_id::associations::unverified::UnverifiedAction;
 use xmtp_id::InboxUpdate;
+use xmtp_id::associations::unverified::UnverifiedAction;
+use xmtp_id::key_package::VerifiedKeyPackageV2;
 use xmtp_mls::context::XmtpSharedContext;
-use xmtp_mls::verified_key_package_v2::VerifiedKeyPackageV2;
 
 #[derive(Debug, Subcommand)]
 pub enum DebugCommands {

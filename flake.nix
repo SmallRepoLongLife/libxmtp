@@ -1,5 +1,11 @@
 # Flake Shell for building release artifacts for swift and kotlin
 {
+  nixConfig = {
+    http-connections = 128;
+    max-substitution-jobs = 128;
+    sandbox = "relaxed";
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     fenix = {
@@ -17,9 +23,10 @@
     };
     rust-flake.url = "github:juspay/rust-flake";
     rust-manifest = {
-      url = "https://static.rust-lang.org/dist/channel-rust-1.92.0.toml";
+      url = "https://static.rust-lang.org/dist/channel-rust-1.94.0.toml";
       flake = false;
     };
+    treefmt-nix.url = "github:numtide/treefmt-nix";
   };
 
   outputs =
@@ -35,13 +42,21 @@
         flake-parts.flakeModules.easyOverlay
         inputs.rust-flake.flakeModules.default
         inputs.rust-flake.flakeModules.nixpkgs
+        inputs.treefmt-nix.flakeModule
         ./nix/rust-defaults.nix
         ./nix/rust.nix
         ./nix/musl-docker.nix
         ./nix/ci-checks.nix
+        ./nix/fmt.nix
+        ./nix/node-packages.nix
+        ./nix/android-packages.nix
       ];
       perSystem =
-        { pkgs, lib, ... }:
+        {
+          pkgs,
+          lib,
+          ...
+        }:
         {
           nixpkgs = self.lib.pkgConfig;
           devShells = {
@@ -55,31 +70,34 @@
           // lib.optionalAttrs pkgs.stdenv.isDarwin {
             ios = pkgs.callPackage ./nix/shells/ios.nix { };
           };
-          packages =
-            let
-              android = pkgs.callPackage ./nix/package/android.nix { };
-              inherit (pkgs.xmtp) androidEnv;
-            in
-            {
-              inherit (pkgs.xmtp) ffi-uniffi-bindgen;
-              wasm-bindings = (pkgs.callPackage ./nix/package/wasm.nix { }).bin;
-              wasm-bindgen-cli = pkgs.callPackage ./nix/lib/packages/wasm-bindgen-cli.nix { };
-              # Android bindings (.so libraries + Kotlin bindings)
-              android-libs = android.aggregate;
-              # Android bindings - host-matching target only (fast dev/CI builds)
-              android-libs-fast = (android.mkAndroid [ androidEnv.hostAndroidTarget ]).aggregate;
-            }
-            // lib.optionalAttrs pkgs.stdenv.isDarwin {
-              # stdenvNoCC is passed to both callPackage (for the aggregate derivation)
-              # This avoids Nix's apple-sdk and cc-wrapper,
-              # which inject -mmacos-version-min flags that
-              # conflict with iOS cross-compilation. The builds are impure (__noChroot)
-              # and use the system Xcode SDK directly via ios-env.nix paths.
-              ios-libs =
+          packages = {
+            inherit (pkgs.xmtp) ffi-uniffi-bindgen;
+            inherit (pkgs) napi-rs-cli wasm-bindgen-cli;
+            wasm-bindings = (pkgs.callPackage ./nix/package/wasm.nix { }).bin;
+            wasm-bindings-test = (pkgs.callPackage ./nix/package/wasm.nix { test = true; }).bin;
+          }
+          // lib.optionalAttrs pkgs.stdenv.isDarwin {
+            # stdenvNoCC is passed to callPackage (for the aggregate derivation).
+            # This avoids Nix's apple-sdk and cc-wrapper,
+            # which inject -mmacos-version-min flags that
+            # conflict with iOS cross-compilation. The builds are impure (__noChroot)
+            # and use the system Xcode SDK directly via ios-env.nix paths.
+            ios-libs =
+              (pkgs.callPackage ./nix/package/ios.nix {
+                stdenv = pkgs.stdenvNoCC;
+              }).aggregate;
+            # iOS bindings - simulator + host macOS only (fast dev/CI builds)
+            ios-libs-fast =
+              (
                 (pkgs.callPackage ./nix/package/ios.nix {
                   stdenv = pkgs.stdenvNoCC;
-                }).aggregate;
-            };
+                }).mkIos
+                [
+                  "aarch64-apple-darwin"
+                  "aarch64-apple-ios-sim"
+                ]
+              ).aggregate;
+          };
         };
     };
 }

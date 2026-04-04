@@ -29,7 +29,7 @@
   ...
 }:
 let
-  inherit (xmtp) iosEnv mobile;
+  inherit (xmtp) iosEnv base;
   # override craneLib rust toolchain with given stdenv
   # https://crane.dev/API.html#mklib
   craneLib = xmtp.craneLib.overrideScope (
@@ -42,14 +42,14 @@ let
   # No clippy/rustfmt — this is a build-only toolchain (the dev shell adds those).
   # overrideToolchain tells crane to use our custom fenix-based toolchain instead
   # of the default nixpkgs rustc.
-  rust-toolchain = xmtp.mkToolchain iosEnv.iosTargets [ ];
-  rust = craneLib.overrideToolchain (p: rust-toolchain);
+  rust-toolchain = p: xmtp.mkToolchain p iosEnv.iosTargets [ ];
+  rust = craneLib.overrideToolchain rust-toolchain;
 
   # Extract version once for use throughout the file
-  version = mobile.mkVersion rust;
+  version = xmtp.mkVersion rust;
 
   # Inherit shared config
-  inherit (mobile) commonArgs bindingsFileset;
+  inherit (base) commonArgs bindingsFileset;
 
   # Build static (.a) and dynamic (.dylib) libraries for a single cross-compilation target.
   #
@@ -83,7 +83,7 @@ let
           # via xcode-select and sets DEVELOPER_DIR, SDKROOT, CC/CXX, and bindgen args.
           buildPhaseCargoCommand = ''
             ${envSetup}
-            cargo build --release --target ${target} -p xmtpv3
+            cargo build --locked --release --target ${target} -p xmtpv3
           '';
         }
       );
@@ -112,9 +112,6 @@ let
       }
     );
 
-  # Per-target derivations (genAttrs creates { "x86_64-apple-darwin" = <drv>; ... })
-  targets = lib.genAttrs iosEnv.iosTargets buildTarget;
-
   # Native host env setup for Swift bindings (builds for macOS host, not iOS).
   nativeEnvSetup = iosEnv.envSetup "aarch64-apple-darwin";
 
@@ -130,18 +127,7 @@ let
       __noChroot = true;
       src = bindingsFileset;
       inherit version;
-      cargoArtifacts = rust.buildDepsOnly (
-        commonArgs
-        // {
-          pname = "xmtpv3-swift-bindings-deps";
-          __noChroot = true;
-          cargoExtraArgs = "-p xmtpv3";
-          buildPhaseCargoCommand = ''
-            ${nativeEnvSetup}
-            cargo build --release -p xmtpv3
-          '';
-        }
-      );
+      cargoArtifacts = xmtp.base.mkCargoArtifacts rust false null;
       cargoExtraArgs = "-p xmtpv3";
       buildPhaseCargoCommand = ''
         ${nativeEnvSetup}
@@ -172,29 +158,37 @@ let
     }
   );
 
-  # Aggregate derivation: combines all per-target static+dynamic libraries + Swift bindings
-  # into a single output directory.
-  # Uses symlinks instead of copies to avoid ~100MB duplication in the Nix store
-  # (each .a file is 20-30MB). The Makefile's lipo/framework targets follow symlinks.
-  # dontUnpack = true because there's no source to extract — this derivation only
-  # creates symlinks to other Nix store paths.
-  aggregate = stdenv.mkDerivation {
-    pname = "xmtpv3-ios-libs";
-    inherit version;
-    dontUnpack = true;
-    installPhase = ''
-      mkdir -p $out/swift
-      ${lib.concatMapStringsSep "\n" (target: ''
-        mkdir -p $out/${target}
-        ln -s ${targets.${target}}/${target}/libxmtpv3.a $out/${target}/libxmtpv3.a
-        ln -s ${targets.${target}}/${target}/libxmtpv3.dylib $out/${target}/libxmtpv3.dylib
-      '') iosEnv.iosTargets}
-      ln -s ${swiftBindings}/swift/xmtpv3.swift $out/swift/xmtpv3.swift
-      ln -s ${swiftBindings}/swift/include $out/swift/include
-    '';
-  };
+  # Function to build a specific set of targets (mirrors mkAndroid in android.nix)
+  mkIos =
+    targetList:
+    let
+      selectedTargets = lib.genAttrs targetList buildTarget;
+
+      selectedAggregate = stdenv.mkDerivation {
+        pname = "xmtpv3-ios-libs";
+        inherit version;
+        dontUnpack = true;
+        installPhase = ''
+          mkdir -p $out/swift
+          ${lib.concatMapStringsSep "\n" (target: ''
+            mkdir -p $out/${target}
+            ln -s ${selectedTargets.${target}}/${target}/libxmtpv3.a $out/${target}/libxmtpv3.a
+            ln -s ${selectedTargets.${target}}/${target}/libxmtpv3.dylib $out/${target}/libxmtpv3.dylib
+          '') targetList}
+          ln -s ${swiftBindings}/swift/xmtpv3.swift $out/swift/xmtpv3.swift
+          ln -s ${swiftBindings}/swift/include $out/swift/include
+        '';
+      };
+    in
+    {
+      targets = selectedTargets;
+      inherit swiftBindings;
+      aggregate = selectedAggregate;
+    };
 
 in
 {
-  inherit targets swiftBindings aggregate;
+  inherit swiftBindings mkIos;
+  # Default: all targets (for backward compat)
+  inherit (mkIos iosEnv.iosTargets) targets aggregate;
 }

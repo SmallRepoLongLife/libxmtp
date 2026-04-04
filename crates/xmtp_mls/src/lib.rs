@@ -14,9 +14,7 @@ pub mod messages;
 pub mod mls_store;
 mod mutex_registry;
 pub mod subscriptions;
-pub mod tasks;
 pub mod utils;
-pub mod verified_key_package_v2;
 pub mod worker;
 pub use definitions::*;
 
@@ -99,9 +97,6 @@ impl GroupCommitLock {
 pub struct MlsGroupGuard {
     _permit: tokio::sync::OwnedMutexGuard<()>,
 }
-
-#[cfg(all(test, target_arch = "wasm32"))]
-wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 #[cfg_attr(not(target_arch = "wasm32"), ctor::ctor)]
 #[cfg(all(test, not(target_arch = "wasm32")))]

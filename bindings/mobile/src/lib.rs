@@ -9,6 +9,9 @@ pub mod message;
 pub mod mls;
 pub mod worker;
 
+#[cfg(test)]
+mod builder_test;
+
 pub use crate::inbox_owner::SigningError;
 pub use logger::{enter_debug_writer, exit_debug_writer};
 pub use message::*;
@@ -50,6 +53,9 @@ pub enum GenericError {
     GroupMutablePermissions(
         #[from] xmtp_mls::groups::group_permissions::GroupMutablePermissionsError,
     ),
+    /// Generic error.
+    ///
+    /// Unclassified error with string message. May be retryable.
     #[error("{err}")]
     Generic { err: String },
     #[error(transparent)]
@@ -61,6 +67,9 @@ pub enum GenericError {
     #[error(transparent)]
     #[error_code(inherit)]
     Verifier(#[from] xmtp_id::scw_verifier::VerifierError),
+    /// Failed to convert to u32.
+    ///
+    /// Numeric conversion failed. Not retryable.
     #[error("Failed to convert to u32")]
     FailedToConvertToU32,
     #[error("Association error: {0}")]
@@ -68,12 +77,18 @@ pub enum GenericError {
     Association(#[from] xmtp_id::associations::AssociationError),
     #[error(transparent)]
     #[error_code(inherit)]
-    DeviceSync(#[from] xmtp_mls::groups::device_sync::DeviceSyncError),
+    DeviceSync(#[from] xmtp_mls::worker::device_sync::DeviceSyncError),
     #[error(transparent)]
     #[error_code(inherit)]
     Identity(#[from] xmtp_mls::identity::IdentityError),
+    /// Join error.
+    ///
+    /// Tokio task join failed. Not retryable.
     #[error(transparent)]
     JoinError(#[from] tokio::task::JoinError),
+    /// I/O error.
+    ///
+    /// File or network I/O failed. May be retryable.
     #[error(transparent)]
     IoError(#[from] tokio::io::Error),
     #[error(transparent)]
@@ -88,12 +103,24 @@ pub enum GenericError {
     #[error(transparent)]
     #[error_code(inherit)]
     AddressValidation(#[from] IdentifierValidationError),
+    /// Log init error.
+    ///
+    /// Failed to initialize log file. Not retryable.
     #[error("Error initializing rolling log file")]
     LogInit(#[from] tracing_appender::rolling::InitError),
+    /// Reload log error.
+    ///
+    /// Failed to reload log subscriber. Not retryable.
     #[error(transparent)]
     ReloadLog(#[from] tracing_subscriber::reload::Error),
+    /// Log error.
+    ///
+    /// Error initializing debug log file. Not retryable.
     #[error("Error initializing debug log file")]
     Log(String),
+    /// Timer expired.
+    ///
+    /// Operation timed out. Retryable.
     #[error("Timer duration expired")]
     Expired,
     #[error(transparent)]
@@ -123,12 +150,6 @@ pub enum FfiError {
     Error(GenericError),
 }
 
-#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
-pub struct FfiErrorInfo {
-    pub code: String,
-    pub message: String,
-}
-
 impl std::fmt::Display for FfiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -156,29 +177,6 @@ impl FfiError {
     pub fn generic(err: impl Into<String>) -> Self {
         FfiError::Error(GenericError::Generic { err: err.into() })
     }
-}
-
-fn parse_error_message(message: &str) -> FfiErrorInfo {
-    if let Some(rest) = message.strip_prefix('[')
-        && let Some(end) = rest.find(']')
-    {
-        let code = rest[..end].to_string();
-        return FfiErrorInfo {
-            code,
-            message: message.to_string(),
-        };
-    }
-
-    FfiErrorInfo {
-        code: "Unknown".to_string(),
-        message: message.to_string(),
-    }
-}
-
-/// Parse an error string like `[ErrorCode] message` into a structured error info.
-#[uniffi::export]
-pub fn parse_xmtp_error(message: String) -> FfiErrorInfo {
-    parse_error_message(&message)
 }
 
 impl From<xmtp_common::time::Expired> for FfiError {
@@ -216,7 +214,12 @@ fn stringify_error_chain<T: Error>(error: &T) -> String {
 
 #[uniffi::export]
 pub fn get_version_info() -> String {
-    include_str!("../libxmtp-version.txt").to_string()
+    format!(
+        "Version: {}\nBranch: {}\nDate: {}",
+        env!("VERGEN_GIT_SHA"),
+        env!("VERGEN_GIT_BRANCH"),
+        env!("VERGEN_GIT_COMMIT_DATE")
+    )
 }
 
 #[cfg(test)]
@@ -291,34 +294,6 @@ mod lib_tests {
             "Expected error to start with [StorageError::NotFound], got: {}",
             display
         );
-    }
-
-    #[test]
-    fn test_parse_xmtp_error_with_code() {
-        let parsed = crate::parse_xmtp_error("[GroupError::NotFound] Group not found".to_string());
-        assert_eq!(parsed.code, "GroupError::NotFound");
-        assert_eq!(parsed.message, "[GroupError::NotFound] Group not found");
-    }
-
-    #[test]
-    fn test_parse_xmtp_error_without_code() {
-        let parsed = crate::parse_xmtp_error("Some error".to_string());
-        assert_eq!(parsed.code, "Unknown");
-        assert_eq!(parsed.message, "Some error");
-    }
-
-    #[test]
-    fn test_parse_xmtp_error_empty_brackets() {
-        let parsed = crate::parse_xmtp_error("[] Empty brackets".to_string());
-        assert_eq!(parsed.code, "");
-        assert_eq!(parsed.message, "[] Empty brackets");
-    }
-
-    #[test]
-    fn test_parse_xmtp_error_nested_brackets() {
-        let parsed =
-            crate::parse_xmtp_error("[Outer::Error] Message with [nested] brackets".to_string());
-        assert_eq!(parsed.code, "Outer::Error");
     }
 
     #[test]

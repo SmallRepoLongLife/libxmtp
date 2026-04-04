@@ -41,34 +41,46 @@ LibXMTP is a shared library implementing the XMTP messaging protocol using MLS (
 ```bash
 dev/up                    # Install dependencies and start Docker services (XMTP node)
 dev/docker/down           # Stop Docker services
+just backend up           # Build validation service + start Docker
+just backend down         # Stop Docker services
 ```
 
 ### Testing
 
 ```bash
-cargo test                          # Run all Rust tests
-cargo test -p xmtp_mls              # Run tests for a specific crate
-cargo test test_name                # Run a single test by name
-cargo test -p xmtp_mls test_name    # Run a single test in a specific crate
-RUST_LOG=off cargo test             # Run tests with minimal logging
-dev/test/wasm                       # Run WASM tests headless
+just test                           # Run all tests (v3 + d14n)
+just test v3                        # Run v3 tests only
+just test d14n                      # Run d14n tests only
+just test crate xmtp_mls            # Run tests for a specific crate
+just test v3 test_name              # Run a specific test in v3
+just test d14n -E 'test(pattern)'   # Run matching tests in d14n
+just wasm test                      # Run WASM unit tests
+just wasm test-v3 test_name         # Run a specific WASM test
+just node test                      # Run Node.js tests
+just ios test                       # Run iOS Swift tests
+just android test                   # Run Android unit tests
 dev/test/coverage                   # Run tests and open coverage report in browser
 ```
+
+All `just test` and `just wasm test` variants pass extra args through to `cargo nextest run`.
 
 ### Code Quality
 
 ```bash
-dev/lint                 # Run all linting (shellcheck, markdown, rust) - ALWAYS run before committing
-dev/fmt                  # Format code (markdown and rust)
-dev/lint-rust            # Run Rust clippy against all targets
+just lint                # Run all linting (rust + config + markdown) - ALWAYS run before committing
+just lint-rust           # Run Rust clippy, fmt check, hakari
+just lint-config         # Lint TOML, Nix, shell scripts
+just format              # Format all code (Rust, Nix, TOML, TypeScript, Swift, Kotlin)
 ```
 
 ### Platform Checks
 
 ```bash
-dev/check-wasm          # Check WASM bindings compile
-dev/check-android       # Check Android bindings
-dev/check-swift         # Check Swift bindings
+just check                          # Check workspace compiles
+just check crate xmtp_mls           # Check specific crate
+just wasm check                     # Check WASM bindings compile
+just android check                  # Check Android bindings
+just ios check                      # Check iOS bindings
 ```
 
 ### Android SDK
@@ -76,7 +88,7 @@ dev/check-swift         # Check Swift bindings
 ```bash
 nix develop .#android             # Enter Android development shell
 ./sdks/android/dev/bindings       # Build Android bindings via Nix
-./sdks/android/dev/build          # Build the full Android SDK
+just android build                # Build Android native bindings
 ```
 
 ### Benchmarks
@@ -89,31 +101,11 @@ cargo bench --features bench -p xmtp_mls --bench group_limit  # Run benchmark ca
 
 ## Writing Tests
 
-- **ALWAYS use `#[xmtp_common::test(unwrap_try = true)]` instead of `#[test]`** - ensures tests run in both native and WASM environments
-- **Use `unwrap_try = true`** - automatically unwraps `?` operators in tests, providing better error messages
-- Use `rstest` for parameterized tests with `#[case]` attributes
-- Use the `tester!` macro for tests that require a wallet
+Use the `writing-rust-tests` skill for comprehensive guidance on test macros, fixtures, WASM compatibility, assertions, and running tests. Key rules:
+
+- **Always use `#[xmtp_common::test(unwrap_try = true)]` instead of `#[test]`**
+- Use the `tester!` macro for tests that require a client
 - `cargo nextest` provides better test isolation
-
-```rust
-#[rstest]
-#[case("input1", "expected1")]
-#[case("input2", "expected2")]
-fn test_function(#[case] input: &str, #[case] expected: &str) {
-    assert_eq!(function_to_test(input), expected);
-}
-
-#[xmtp_common::test(unwrap_try = true)]
-async fn test_simple() {
-    // Single test case - can use ? operator freely
-}
-```
-
-### Log Output Control
-
-- `CONTEXTUAL=1 cargo test` - Async-aware structured logging (supports `TestLogReplace` for readable IDs)
-- `STRUCTURED=1 cargo test` - JSON structured logs
-- `RUST_LOG=xmtp_mls=debug,xmtp_api=off cargo test` - Filter by crate
 
 ## Database
 
@@ -121,6 +113,6 @@ Uses Diesel ORM with encrypted SQLite. Migrations are in `crates/xmtp_db/migrati
 
 ## Code Change Requirements
 
-- **Always run `./dev/lint`** before committing Rust changes
-- For `bindings_node` changes, also run `yarn && yarn format:check` in `bindings/node`
+- **Always run `just lint`** before committing Rust changes
+- For `bindings_node` changes, also run `just node lint`
 - Add test coverage for new functionality

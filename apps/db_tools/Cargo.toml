@@ -1,0 +1,32 @@
+[package]
+name = "xmtp-db-tools"
+description = "migration/SQLite tools for xmtp databases"
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+diesel = { workspace = true, features = ["sqlite"] }
+diesel_migrations = { workspace = true, features = ["sqlite"] }
+dotenvy = "0.15.7"
+hex.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+xmtp_common.workspace = true
+xmtp_db.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+xmtp_mls = { workspace = true, features = ["test-utils"] }
+
+[features]
+default = []
+test-utils = []
+bench = []

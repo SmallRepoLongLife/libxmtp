@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Benchmarks for sync_all_conversations operations with fresh setup per iteration
 //!
 //! This benchmark measures the performance of sync_all_groups under various conditions:
@@ -62,8 +64,8 @@ async fn setup_sync_conversations_bench(
     groups_with_messages: usize,
     expected_synced_count: usize,
 ) -> Arc<SyncConversationsBenchSetup> {
-    let client = new_client(false).await;
-    let other_client = new_client(false).await;
+    let client = new_client().await;
+    let other_client = new_client().await;
 
     let style =
         ProgressStyle::with_template("{bar} {pos}/{len} elapsed {elapsed} remaining {eta_precise}");
