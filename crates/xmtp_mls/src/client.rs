@@ -65,6 +65,7 @@ use xmtp_proto::{
 };
 use xmtp_proto::{types::InstallationId, xmtp::identity::associations::IdentifierKind};
 
+use xmtp_proto::types::GroupId;
 /// Enum representing the network the Client is connected to
 #[derive(Clone, Copy, Default, Debug)]
 pub enum Network {
@@ -170,6 +171,16 @@ pub enum ClientError {
     /// Data type failed to convert. Not retryable.
     #[error(transparent)]
     Conversion(#[from] xmtp_proto::ConversionError),
+    /// Registration not visible.
+    ///
+    /// Registration was not visible on the required number of nodes within the timeout. Not retryable.
+    #[error("Registration not visible on required nodes: {failed_nodes:?}")]
+    RegistrationNotVisible { failed_nodes: Vec<u32> },
+    /// Envelopes not yet visible.
+    ///
+    /// Registration envelopes haven't propagated to the node yet. Retryable.
+    #[error("Envelopes not yet visible on node {node_id}")]
+    EnvelopesNotYetVisible { node_id: u32 },
 }
 
 impl ClientError {
@@ -200,7 +211,12 @@ impl xmtp_common::RetryableError for ClientError {
             ClientError::Api(api_error) => retryable!(api_error),
             ClientError::Storage(storage_error) => retryable!(storage_error),
             ClientError::Db(db) => retryable!(db),
+            // SCW verification errors carry retryability through SignatureError;
+            // transient RPC provider failures must not advance the welcome cursor.
+            // See xmtp/libxmtp#3394.
+            ClientError::SignatureValidation(e) => retryable!(e),
             ClientError::Generic(err) => err.contains("database is locked"),
+            ClientError::EnvelopesNotYetVisible { .. } => true,
             _ => false,
         }
     }
@@ -739,7 +755,7 @@ where
     ///
     /// Returns a [`MlsGroup`] if the group exists, or an error if it does not
     ///
-    pub fn group(&self, group_id: &Vec<u8>) -> Result<MlsGroup<Context>, ClientError> {
+    pub fn group(&self, group_id: &[u8]) -> Result<MlsGroup<Context>, ClientError> {
         MlsStore::new(self.context.clone())
             .group(group_id)
             .map_err(Into::into)
@@ -751,7 +767,7 @@ where
     ///
     pub fn stitched_group(&self, group_id: &[u8]) -> Result<MlsGroup<Context>, ClientError> {
         let conn = self.context.db();
-        let stored_group = conn.fetch_stitched(group_id)?;
+        let stored_group = conn.fetch_stitched(&GroupId::from(group_id))?;
         stored_group
             .map(|g| {
                 MlsGroup::new(
@@ -762,7 +778,7 @@ where
                     g.created_at_ns,
                 )
             })
-            .ok_or(NotFound::GroupById(group_id.to_vec()))
+            .ok_or(NotFound::GroupById(GroupId::from(group_id)))
             .map_err(Into::into)
     }
 
@@ -848,16 +864,19 @@ where
         let conn = self.context.db();
 
         // Fetch the message before deleting so we can emit the decoded message in the event
-        let decoded_message = self.message_v2(message_id.clone()).ok();
+        let msg = conn.get_group_message(&message_id)?;
 
         let num_deleted = conn.delete_message_by_id(&message_id)?;
         // Fire a local event if the message was successfully deleted
         if num_deleted > 0
-            && let Some(message) = decoded_message
+            && let Some(message) = msg
         {
-            let _ = self.context.local_events().send(
-                crate::subscriptions::LocalEvents::MessageDeleted(Box::new(message)),
-            );
+            let _ =
+                self.context
+                    .local_events()
+                    .send(crate::subscriptions::LocalEvents::MsgsDeleted(vec![
+                        message,
+                    ]));
         }
 
         Ok(num_deleted)
@@ -971,7 +990,8 @@ where
             .await?;
 
         // Step 4: Publish identity update (makes installation visible)
-        self.context
+        let registration_cursor = self
+            .context
             .api()
             .publish_identity_update(identity_update)
             .await?;
@@ -1000,7 +1020,12 @@ where
             .reset_key_package_rotation_queue(KEY_PACKAGE_ROTATION_INTERVAL_NS)?;
 
         // Mark identity as ready
-        StoredIdentity::try_from(self.identity())?.store(&self.context.db())?;
+        let mut stored_identity = StoredIdentity::try_from(self.identity())?;
+        if let Some(cursor) = registration_cursor {
+            stored_identity.registration_cursor_originator_id = Some(cursor.originator_id as i64);
+            stored_identity.registration_cursor_sequence_id = Some(cursor.sequence_id as i64);
+        }
+        stored_identity.store(&self.context.db())?;
         self.identity().set_ready();
         Ok(())
     }
@@ -1147,8 +1172,8 @@ where
             .api()
             .get_inbox_ids(requests)
             .await?
-            .into_iter()
-            .filter_map(|(ident, _)| Some((ident.try_into().ok()?, true)))
+            .into_keys()
+            .filter_map(|ident| Some((ident.try_into().ok()?, true)))
             .collect();
 
         // Fill in the rest with false
@@ -1206,12 +1231,34 @@ pub(crate) mod tests {
             .unwrap();
 
         let conn = amal.context.store().conn();
-        conn.raw_query_write(|conn| diesel::delete(identity_updates::table).execute(conn))
+        conn.raw_query(|conn| diesel::delete(identity_updates::table).execute(conn))
             .unwrap();
 
         let members = group.members().await.unwrap();
         // The three installations should count as two members
         assert_eq!(members.len(), 2);
+    }
+
+    #[xmtp_common::test]
+    fn test_client_error_signature_validation_retryability_propagates() {
+        use xmtp_common::RetryableError;
+        use xmtp_id::associations::signature::SignatureError;
+        use xmtp_id::scw_verifier::VerifierError;
+
+        // A retryable verifier error (transient RPC failure) must surface as
+        // retryable at the ClientError layer so the welcome sync path does not
+        // advance the cursor past welcomes involving SCW users. See xmtp/libxmtp#3394.
+        let retryable = super::ClientError::SignatureValidation(SignatureError::VerifierError(
+            VerifierError::NoVerifier("eip155:1".to_string()),
+        ));
+        assert!(retryable.is_retryable());
+
+        // A terminal verifier error (malformed input) must remain non-retryable
+        // so we don't spin forever on bad data.
+        let non_retryable = super::ClientError::SignatureValidation(SignatureError::VerifierError(
+            VerifierError::MalformedEipUrl,
+        ));
+        assert!(!non_retryable.is_retryable());
     }
 
     #[xmtp_common::test]

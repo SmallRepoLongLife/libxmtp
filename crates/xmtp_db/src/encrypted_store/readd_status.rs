@@ -8,11 +8,12 @@ use super::{
 };
 use crate::{ConnectionExt, impl_store};
 
+use xmtp_proto::types::GroupId;
 #[derive(Identifiable, Queryable, Selectable, Insertable, Debug, Clone, PartialEq, Eq)]
 #[diesel(table_name = readd_status)]
 #[diesel(primary_key(group_id, installation_id))]
 pub struct ReaddStatus {
-    pub group_id: Vec<u8>,
+    pub group_id: GroupId,
     pub installation_id: Vec<u8>,
     pub requested_at_sequence_id: Option<i64>,
     pub responded_at_sequence_id: Option<i64>,
@@ -23,13 +24,13 @@ impl_store!(ReaddStatus, readd_status);
 pub trait QueryReaddStatus {
     fn get_readd_status(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_id: &[u8],
     ) -> Result<Option<ReaddStatus>, crate::ConnectionError>;
 
     fn is_awaiting_readd(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_id: &[u8],
     ) -> Result<bool, crate::ConnectionError>;
 
@@ -38,7 +39,7 @@ pub trait QueryReaddStatus {
     /// Inserts the row if it doesn't exist.
     fn update_requested_at_sequence_id(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_id: &[u8],
         sequence_id: i64,
     ) -> Result<(), crate::ConnectionError>;
@@ -48,26 +49,26 @@ pub trait QueryReaddStatus {
     /// Inserts the row if it doesn't exist.
     fn update_responded_at_sequence_id(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_id: &[u8],
         sequence_id: i64,
     ) -> Result<(), crate::ConnectionError>;
 
     fn delete_other_readd_statuses(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         self_installation_id: &[u8],
     ) -> Result<(), crate::ConnectionError>;
 
     fn delete_readd_statuses(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_ids: HashSet<Vec<u8>>,
     ) -> Result<(), crate::ConnectionError>;
 
     fn get_readds_awaiting_response(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         self_installation_id: &[u8],
     ) -> Result<Vec<ReaddStatus>, crate::ConnectionError>;
 }
@@ -75,13 +76,13 @@ pub trait QueryReaddStatus {
 impl<C: ConnectionExt> QueryReaddStatus for DbConnection<C> {
     fn get_readd_status(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_id: &[u8],
     ) -> Result<Option<ReaddStatus>, crate::ConnectionError> {
         use super::schema::readd_status::dsl as readd_dsl;
         use diesel::QueryDsl;
 
-        self.raw_query_read(|conn| {
+        self.raw_query(|conn| {
             readd_dsl::readd_status
                 .filter(readd_dsl::group_id.eq(group_id))
                 .filter(readd_dsl::installation_id.eq(installation_id))
@@ -92,7 +93,7 @@ impl<C: ConnectionExt> QueryReaddStatus for DbConnection<C> {
 
     fn is_awaiting_readd(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_id: &[u8],
     ) -> Result<bool, crate::ConnectionError> {
         let readd_status = self.get_readd_status(group_id, installation_id)?;
@@ -107,7 +108,7 @@ impl<C: ConnectionExt> QueryReaddStatus for DbConnection<C> {
 
     fn update_requested_at_sequence_id(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_id: &[u8],
         sequence_id: i64,
     ) -> Result<(), crate::ConnectionError> {
@@ -115,13 +116,13 @@ impl<C: ConnectionExt> QueryReaddStatus for DbConnection<C> {
         use diesel::query_dsl::methods::FilterDsl;
 
         let new_status = super::readd_status::ReaddStatus {
-            group_id: group_id.to_vec(),
+            group_id: group_id.clone(),
             installation_id: installation_id.to_vec(),
             requested_at_sequence_id: Some(sequence_id),
             responded_at_sequence_id: None,
         };
 
-        self.raw_query_write(|conn| {
+        self.raw_query(|conn| {
             diesel::insert_into(readd_dsl::readd_status)
                 .values(&new_status)
                 .on_conflict((readd_dsl::group_id, readd_dsl::installation_id))
@@ -140,7 +141,7 @@ impl<C: ConnectionExt> QueryReaddStatus for DbConnection<C> {
 
     fn update_responded_at_sequence_id(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_id: &[u8],
         sequence_id: i64,
     ) -> Result<(), crate::ConnectionError> {
@@ -148,13 +149,13 @@ impl<C: ConnectionExt> QueryReaddStatus for DbConnection<C> {
         use diesel::query_dsl::methods::FilterDsl;
 
         let new_status = super::readd_status::ReaddStatus {
-            group_id: group_id.to_vec(),
+            group_id: group_id.clone(),
             installation_id: installation_id.to_vec(),
             requested_at_sequence_id: None,
             responded_at_sequence_id: Some(sequence_id),
         };
 
-        self.raw_query_write(|conn| {
+        self.raw_query(|conn| {
             diesel::insert_into(readd_dsl::readd_status)
                 .values(&new_status)
                 .on_conflict((readd_dsl::group_id, readd_dsl::installation_id))
@@ -173,13 +174,13 @@ impl<C: ConnectionExt> QueryReaddStatus for DbConnection<C> {
 
     fn delete_other_readd_statuses(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         self_installation_id: &[u8],
     ) -> Result<(), crate::ConnectionError> {
         use super::schema::readd_status::dsl as readd_dsl;
         use diesel::{ExpressionMethods, QueryDsl};
 
-        self.raw_query_write(|conn| {
+        self.raw_query(|conn| {
             diesel::delete(
                 readd_dsl::readd_status
                     .filter(readd_dsl::group_id.eq(group_id))
@@ -192,13 +193,13 @@ impl<C: ConnectionExt> QueryReaddStatus for DbConnection<C> {
 
     fn delete_readd_statuses(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_ids: HashSet<Vec<u8>>,
     ) -> Result<(), crate::ConnectionError> {
         use super::schema::readd_status::dsl as readd_dsl;
         use diesel::{ExpressionMethods, QueryDsl};
 
-        self.raw_query_write(|conn| {
+        self.raw_query(|conn| {
             diesel::delete(
                 readd_dsl::readd_status
                     .filter(readd_dsl::group_id.eq(group_id))
@@ -211,13 +212,13 @@ impl<C: ConnectionExt> QueryReaddStatus for DbConnection<C> {
 
     fn get_readds_awaiting_response(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         self_installation_id: &[u8],
     ) -> Result<Vec<ReaddStatus>, crate::ConnectionError> {
         use super::schema::readd_status::dsl as readd_dsl;
         use diesel::{ExpressionMethods, QueryDsl};
 
-        self.raw_query_read(|conn| {
+        self.raw_query(|conn| {
             readd_dsl::readd_status
                 .filter(readd_dsl::group_id.eq(group_id))
                 .filter(readd_dsl::installation_id.ne(self_installation_id))
@@ -238,7 +239,7 @@ where
 {
     fn get_readd_status(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_id: &[u8],
     ) -> Result<Option<ReaddStatus>, crate::ConnectionError> {
         (**self).get_readd_status(group_id, installation_id)
@@ -246,7 +247,7 @@ where
 
     fn is_awaiting_readd(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_id: &[u8],
     ) -> Result<bool, crate::ConnectionError> {
         (**self).is_awaiting_readd(group_id, installation_id)
@@ -254,7 +255,7 @@ where
 
     fn update_requested_at_sequence_id(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_id: &[u8],
         sequence_id: i64,
     ) -> Result<(), crate::ConnectionError> {
@@ -263,7 +264,7 @@ where
 
     fn update_responded_at_sequence_id(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_id: &[u8],
         sequence_id: i64,
     ) -> Result<(), crate::ConnectionError> {
@@ -272,7 +273,7 @@ where
 
     fn delete_other_readd_statuses(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         self_installation_id: &[u8],
     ) -> Result<(), crate::ConnectionError> {
         (**self).delete_other_readd_statuses(group_id, self_installation_id)
@@ -280,7 +281,7 @@ where
 
     fn delete_readd_statuses(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         installation_ids: HashSet<Vec<u8>>,
     ) -> Result<(), crate::ConnectionError> {
         (**self).delete_readd_statuses(group_id, installation_ids)
@@ -288,7 +289,7 @@ where
 
     fn get_readds_awaiting_response(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
         self_installation_id: &[u8],
     ) -> Result<Vec<ReaddStatus>, crate::ConnectionError> {
         (**self).get_readds_awaiting_response(group_id, self_installation_id)
@@ -303,7 +304,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_get_readd_status_not_found() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
 
             let result = conn.get_readd_status(&group_id, &installation_id).unwrap();
@@ -314,7 +315,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_store_and_get_readd_status() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
 
             let status = ReaddStatus {
@@ -339,7 +340,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_update_requested_at_sequence_id_creates_new() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
             let sequence_id = 100;
 
@@ -359,7 +360,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_update_requested_at_sequence_id_updates_existing() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
 
             // Create initial status
@@ -387,7 +388,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_update_requested_at_sequence_id_only_updates_if_higher() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
 
             // Create initial status with high sequence_id
@@ -415,7 +416,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_update_requested_at_sequence_id_updates_from_null() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
 
             // Create initial status with null requested_at_sequence_id
@@ -443,7 +444,7 @@ mod tests {
     #[xmtp_common::test]
     async fn test_update_responded_at_sequence_id_creates_new() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
             let sequence_id = 100;
 
@@ -463,7 +464,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_update_responded_at_sequence_id_only_updates_if_higher() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
 
             // Create initial status with high responded_at_sequence_id
@@ -502,7 +503,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_is_awaiting_readd_no_status() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
 
             // Should return false when no readd status exists
@@ -514,7 +515,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_is_awaiting_readd_no_request() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
 
             // Create a readd status without a requested_at_sequence_id
@@ -536,7 +537,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_is_awaiting_readd_request_pending() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
 
             // Create a readd status with requested_at > responded_at
@@ -558,7 +559,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_is_awaiting_readd_request_fulfilled() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
 
             // Create a readd status with requested_at <= responded_at
@@ -580,7 +581,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_is_awaiting_readd_equal_sequence_ids() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
 
             // Create a readd status with requested_at == responded_at
@@ -604,7 +605,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_is_awaiting_readd_no_responded_at() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let installation_id = vec![4, 5, 6];
 
             // Create a readd status with requested_at but no responded_at (defaults to 0)
@@ -626,7 +627,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_delete_other_readd_statuses() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let keep_installation_id = vec![10, 11, 12];
             let delete_installation_id_1 = vec![20, 21, 22];
             let delete_installation_id_2 = vec![30, 31, 32];
@@ -658,7 +659,7 @@ mod tests {
 
             // Create a status for a different group (should not be affected)
             let different_group_status = ReaddStatus {
-                group_id: vec![4, 5, 6],
+                group_id: GroupId::from(vec![4, 5, 6]),
                 installation_id: vec![40, 41, 42],
                 requested_at_sequence_id: Some(25),
                 responded_at_sequence_id: Some(12),
@@ -687,7 +688,9 @@ mod tests {
             assert!(deleted_status_2.is_none());
 
             // Verify the status in the different group was not affected
-            let different_group_check = conn.get_readd_status(&[4, 5, 6], &[40, 41, 42]).unwrap();
+            let different_group_check = conn
+                .get_readd_status(&GroupId::from(&[4u8, 5, 6][..]), &[40, 41, 42])
+                .unwrap();
             assert!(different_group_check.is_some());
         })
     }
@@ -695,7 +698,7 @@ mod tests {
     #[xmtp_common::test]
     fn test_get_readds_awaiting_response() {
         with_connection(|conn| {
-            let group_id = vec![1, 2, 3];
+            let group_id: GroupId = vec![1, 2, 3].into();
             let self_installation_id = vec![10, 11, 12];
             let other_installation_id_1 = vec![20, 21, 22];
             let other_installation_id_2 = vec![30, 31, 32];
@@ -749,7 +752,7 @@ mod tests {
 
             // Case 6: Different group (should be excluded)
             let different_group_status = ReaddStatus {
-                group_id: vec![4, 5, 6],
+                group_id: GroupId::from(vec![4, 5, 6]),
                 installation_id: vec![60, 61, 62],
                 requested_at_sequence_id: Some(25),
                 responded_at_sequence_id: Some(15),
@@ -772,7 +775,7 @@ mod tests {
 
             // Verify the details of the returned statuses
             for status in result {
-                assert_eq!(status.group_id, group_id);
+                assert_eq!(status.group_id.as_slice(), group_id.as_slice());
                 assert_ne!(status.installation_id, self_installation_id);
                 assert!(status.requested_at_sequence_id.is_some());
 

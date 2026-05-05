@@ -18,9 +18,7 @@ use xmtp_common::{Retry, retry_async};
 use xmtp_db::refresh_state::EntityKind;
 use xmtp_db::{consent_record::ConsentState, group::GroupQueryArgs, prelude::*};
 use xmtp_macro::log_event;
-use xmtp_proto::types::GlobalCursor;
-use xmtp_proto::types::GroupId;
-use xmtp_proto::types::GroupMessageMetadata;
+use xmtp_proto::types::{GlobalCursor, GroupId, GroupMessageMetadata};
 
 #[derive(Debug, Clone)]
 pub struct GroupSyncSummary {
@@ -209,12 +207,16 @@ where
         let db = self.context.db();
         let api = self.context.api();
 
-        let group_ids: Vec<&[u8]> = groups.iter().map(|group| group.group_id.as_ref()).collect();
+        let group_ids: Vec<GroupId> = groups
+            .iter()
+            .map(|group| GroupId::from(group.group_id.as_slice()))
+            .collect();
+        let id_slices: Vec<&[u8]> = group_ids.iter().map(|id| id.as_ref()).collect();
         let last_synced_cursors = db.get_last_cursor_for_ids(
-            &group_ids,
+            &id_slices,
             &[EntityKind::ApplicationMessage, EntityKind::CommitMessage],
         )?;
-        let latest_message_metadata = api.get_newest_message_metadata(group_ids).await?;
+        let latest_message_metadata = api.get_newest_message_metadata(&group_ids).await?;
 
         let group_ids_needing_sync =
             filter_groups_with_new_messages(last_synced_cursors, latest_message_metadata);
@@ -349,7 +351,7 @@ where
 fn filter_groups_with_new_messages(
     last_synced_cursors: HashMap<Vec<u8>, GlobalCursor>,
     latest_messages: HashMap<GroupId, GroupMessageMetadata>,
-) -> HashSet<Vec<u8>> {
+) -> HashSet<GroupId> {
     let mut groups_with_unread_messages = HashSet::new();
     for (group_id, latest_message_metadata) in latest_messages {
         match last_synced_cursors.get(group_id.as_ref()) {
@@ -359,12 +361,12 @@ fn filter_groups_with_new_messages(
                 if cursor.get(&latest_message_metadata.cursor.originator_id)
                     < latest_message_metadata.cursor.sequence_id
                 {
-                    groups_with_unread_messages.insert(group_id.to_vec());
+                    groups_with_unread_messages.insert(group_id);
                 }
             }
             None => {
                 // No cursor found. Must have never been synced before.
-                groups_with_unread_messages.insert(group_id.to_vec());
+                groups_with_unread_messages.insert(group_id);
             }
         }
     }
@@ -391,7 +393,9 @@ mod tests {
     use xmtp_db::{MemoryStorage, mock::MockDbQuery, sql_key_store::mock::MockSqlKeyStore};
     use xmtp_id::key_package::WrapperAlgorithm;
     use xmtp_proto::mls_v1::WelcomeMetadata;
-    use xmtp_proto::types::{Cursor, WelcomeMessage, WelcomeMessageType, WelcomeMessageV1};
+    use xmtp_proto::types::{
+        Cursor, GroupId, WelcomeMessage, WelcomeMessageType, WelcomeMessageV1,
+    };
 
     fn generate_welcome(
         id: u64,
@@ -795,7 +799,7 @@ mod tests {
         let result = filter_groups_with_new_messages(last_synced, latest);
 
         assert_eq!(result.len(), 1);
-        assert!(result.contains(&group_id_1));
+        assert!(result.contains(&GroupId::from(group_id_1.as_slice())));
     }
 
     #[xmtp_common::test]
@@ -821,7 +825,7 @@ mod tests {
         let result = filter_groups_with_new_messages(last_synced, latest);
 
         assert_eq!(result.len(), 1);
-        assert!(result.contains(&group_never_synced));
+        assert!(result.contains(&GroupId::from(group_never_synced.as_slice())));
     }
 
     #[xmtp_common::test]
@@ -845,7 +849,7 @@ mod tests {
         let result = filter_groups_with_new_messages(last_synced, latest);
 
         assert_eq!(result.len(), 1);
-        assert!(result.contains(&group_id));
+        assert!(result.contains(&GroupId::from(group_id.as_slice())));
     }
 
     #[xmtp_common::test]
@@ -864,7 +868,7 @@ mod tests {
         let result = filter_groups_with_new_messages(last_synced, latest);
 
         assert_eq!(result.len(), 1);
-        assert!(result.contains(&group_id));
+        assert!(result.contains(&GroupId::from(group_id.as_slice())));
     }
 
     // I have no idea why this test is specifically failing on WASM
@@ -924,7 +928,7 @@ mod tests {
         let result = filter_groups_with_new_messages(last_synced, latest);
 
         assert_eq!(result.len(), 2);
-        assert!(result.contains(&g1));
-        assert!(result.contains(&g4));
+        assert!(result.contains(&GroupId::from(g1.as_slice())));
+        assert!(result.contains(&GroupId::from(g4.as_slice())));
     }
 }

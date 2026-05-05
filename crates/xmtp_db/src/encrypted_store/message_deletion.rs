@@ -4,6 +4,7 @@ use crate::{DbConnection, impl_store, impl_store_or_ignore, schema::message_dele
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use xmtp_proto::types::GroupId;
 #[derive(
     Debug,
     Clone,
@@ -23,7 +24,7 @@ pub struct StoredMessageDeletion {
     /// The ID of the DeleteMessage in the group_messages table
     pub id: Vec<u8>,
     /// The group this deletion belongs to
-    pub group_id: Vec<u8>,
+    pub group_id: GroupId,
     /// The ID of the original message being deleted
     pub deleted_message_id: Vec<u8>,
     /// The inbox_id of who sent the delete message
@@ -60,7 +61,7 @@ pub trait QueryMessageDeletion {
     /// Get all deletions in a group
     fn get_group_deletions(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
     ) -> Result<Vec<StoredMessageDeletion>, crate::ConnectionError>;
 
     /// Check if a message has been deleted
@@ -94,7 +95,7 @@ where
 
     fn get_group_deletions(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
     ) -> Result<Vec<StoredMessageDeletion>, crate::ConnectionError> {
         (**self).get_group_deletions(group_id)
     }
@@ -109,7 +110,7 @@ impl<C: ConnectionExt> QueryMessageDeletion for DbConnection<C> {
         &self,
         id: &[u8],
     ) -> Result<Option<StoredMessageDeletion>, crate::ConnectionError> {
-        self.raw_query_read(|conn| {
+        self.raw_query(|conn| {
             dsl::message_deletions
                 .filter(dsl::id.eq(id))
                 .first(conn)
@@ -121,7 +122,7 @@ impl<C: ConnectionExt> QueryMessageDeletion for DbConnection<C> {
         &self,
         deleted_message_id: &[u8],
     ) -> Result<Option<StoredMessageDeletion>, crate::ConnectionError> {
-        self.raw_query_read(|conn| {
+        self.raw_query(|conn| {
             dsl::message_deletions
                 .filter(dsl::deleted_message_id.eq(deleted_message_id))
                 .first(conn)
@@ -137,7 +138,7 @@ impl<C: ConnectionExt> QueryMessageDeletion for DbConnection<C> {
             return Ok(vec![]);
         }
 
-        self.raw_query_read(|conn| {
+        self.raw_query(|conn| {
             dsl::message_deletions
                 .filter(dsl::deleted_message_id.eq_any(message_ids))
                 .load(conn)
@@ -146,9 +147,9 @@ impl<C: ConnectionExt> QueryMessageDeletion for DbConnection<C> {
 
     fn get_group_deletions(
         &self,
-        group_id: &[u8],
+        group_id: &GroupId,
     ) -> Result<Vec<StoredMessageDeletion>, crate::ConnectionError> {
-        self.raw_query_read(|conn| {
+        self.raw_query(|conn| {
             dsl::message_deletions
                 .filter(dsl::group_id.eq(group_id))
                 .load(conn)
@@ -156,7 +157,7 @@ impl<C: ConnectionExt> QueryMessageDeletion for DbConnection<C> {
     }
 
     fn is_message_deleted(&self, message_id: &[u8]) -> Result<bool, crate::ConnectionError> {
-        self.raw_query_read(|conn| {
+        self.raw_query(|conn| {
             diesel::dsl::select(diesel::dsl::exists(
                 dsl::message_deletions.filter(dsl::deleted_message_id.eq(message_id)),
             ))
@@ -176,7 +177,7 @@ mod tests {
 
     fn create_test_group(conn: &DbConnection<impl ConnectionExt>, group_id: Vec<u8>) {
         StoredGroup {
-            id: group_id,
+            id: group_id.into(),
             created_at_ns: 0,
             membership_state: GroupMembershipState::Allowed,
             installations_last_checked: 0,
@@ -208,7 +209,7 @@ mod tests {
     ) {
         StoredGroupMessage {
             id,
-            group_id,
+            group_id: group_id.into(),
             decrypted_message_bytes: vec![],
             sent_at_ns: 1000,
             kind: GroupMessageKind::Application,
@@ -243,7 +244,7 @@ mod tests {
 
             let deletion = StoredMessageDeletion {
                 id: delete_message_id.clone(),
-                group_id: group_id.clone(),
+                group_id: group_id.clone().into(),
                 deleted_message_id: message_id.clone(),
                 deleted_by_inbox_id: "sender".to_string(),
                 is_super_admin_deletion: false,
@@ -281,7 +282,7 @@ mod tests {
             // Store deletion
             StoredMessageDeletion {
                 id: delete_message_id.clone(),
-                group_id: group_id.clone(),
+                group_id: group_id.clone().into(),
                 deleted_message_id: message_id.clone(),
                 deleted_by_inbox_id: "sender".to_string(),
                 is_super_admin_deletion: false,
@@ -314,7 +315,7 @@ mod tests {
             // Delete msg1 and msg2
             StoredMessageDeletion {
                 id: del1.clone(),
-                group_id: group_id.clone(),
+                group_id: group_id.clone().into(),
                 deleted_message_id: msg1.clone(),
                 deleted_by_inbox_id: "sender".to_string(),
                 is_super_admin_deletion: false,
@@ -324,7 +325,7 @@ mod tests {
 
             StoredMessageDeletion {
                 id: del2.clone(),
-                group_id: group_id.clone(),
+                group_id: group_id.clone().into(),
                 deleted_message_id: msg2.clone(),
                 deleted_by_inbox_id: "admin".to_string(),
                 is_super_admin_deletion: true,
@@ -361,7 +362,7 @@ mod tests {
 
             StoredMessageDeletion {
                 id: del1.clone(),
-                group_id: group1.clone(),
+                group_id: group1.clone().into(),
                 deleted_message_id: msg1.clone(),
                 deleted_by_inbox_id: "sender".to_string(),
                 is_super_admin_deletion: false,
@@ -371,7 +372,7 @@ mod tests {
 
             StoredMessageDeletion {
                 id: del2.clone(),
-                group_id: group2.clone(),
+                group_id: group2.clone().into(),
                 deleted_message_id: msg2.clone(),
                 deleted_by_inbox_id: "sender".to_string(),
                 is_super_admin_deletion: false,
@@ -380,12 +381,12 @@ mod tests {
             .store(conn)?;
 
             // Get deletions for group1
-            let group1_deletions = conn.get_group_deletions(&group1)?;
+            let group1_deletions = conn.get_group_deletions(&GroupId::from(group1.clone()))?;
             assert_eq!(group1_deletions.len(), 1);
             assert_eq!(group1_deletions[0].deleted_message_id, msg1);
 
             // Get deletions for group2
-            let group2_deletions = conn.get_group_deletions(&group2)?;
+            let group2_deletions = conn.get_group_deletions(&GroupId::from(group2.clone()))?;
             assert_eq!(group2_deletions.len(), 1);
             assert_eq!(group2_deletions[0].deleted_message_id, msg2);
         })

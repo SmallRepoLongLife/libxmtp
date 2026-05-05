@@ -30,6 +30,10 @@ pub struct AppOpts {
     /// Runs at the end of execution, so operations will still be carried out
     #[arg(long)]
     pub clear: bool,
+    /// Emit CSV metric lines (latency_seconds, throughput_events, event)
+    /// to stdout. Off by default for clean CLI output.
+    #[arg(long)]
+    pub metrics: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -190,12 +194,23 @@ pub struct InfoOpts {
     pub app: bool,
 }
 
+#[derive(ValueEnum, Debug, Copy, Clone)]
+pub enum ExportEntityKind {
+    Group,
+    Message,
+    Identity,
+    GroupTopics,
+    IdentityTopics,
+    KeyPackageTopics,
+    WelcomeMessageTopics,
+}
+
 /// Export information to JSON
 #[derive(Args, Debug)]
 pub struct ExportOpts {
     /// Entity to export
     #[arg(long, short)]
-    pub entity: EntityKind,
+    pub entity: ExportEntityKind,
     /// File to write to
     #[arg(long, short)]
     pub out: Option<PathBuf>,
@@ -256,9 +271,23 @@ impl std::fmt::Display for EntityKind {
     }
 }
 
+/// Log format for stdout output
+#[derive(ValueEnum, Debug, Clone, Default)]
+pub enum LogFormat {
+    /// Human-readable, colored in terminals
+    #[default]
+    Text,
+    /// Structured JSON (for Docker/Datadog)
+    Json,
+}
+
 /// specify the log output
 #[derive(Args, Debug)]
 pub struct LogOptions {
+    /// Stdout log format: "text" (default, colored in terminals) or "json" (for Docker/Datadog).
+    /// Can also be set via XDBG_LOG_FORMAT env var.
+    #[arg(long, env = "XDBG_LOG_FORMAT", default_value = "text")]
+    pub log_format: LogFormat,
     /// Output libxmtp logs into file with a structured, ndJSON format
     #[arg(long)]
     pub json: bool,
@@ -295,6 +324,11 @@ pub struct BackendOpts {
     /// Enable the decentralization backend
     #[arg(short, long)]
     pub d14n: bool,
+    /// Connect reads directly to a single xmtpd node for D14n, bypassing MultiNodeClient
+    /// gateway discovery. Writes still route through --xmtpd-gateway-url.
+    /// Requires --d14n.
+    #[arg(long, requires = "d14n")]
+    pub d14n_host: Option<url::Url>,
     /// Use the perf gateway (closest-node selection) instead of the default gateway.
     /// Requires --d14n.
     #[arg(short, long, requires = "d14n")]
@@ -353,24 +387,9 @@ impl BackendOpts {
     }
 
     pub fn connect(&self) -> eyre::Result<crate::DbgClientApi> {
-        let network = self.network_url();
         let mut builder = MessageBackendBuilder::default();
-        builder.v3_host(network.as_str());
-        if self.enable_migration {
-            let xmtpd_gateway_host = self.xmtpd_gateway_url()?;
-            trace!(url = %network, xmtpd_gateway = %xmtpd_gateway_host,  "create grpc");
-            return Ok(builder.gateway_host(xmtpd_gateway_host.as_str()).build()?);
-        }
-        if self.d14n {
-            let xmtpd_gateway_host = self.xmtpd_gateway_url()?;
-            trace!(url = %network, xmtpd_gateway = %xmtpd_gateway_host,  "create grpc");
-            Ok(builder
-                .gateway_host(xmtpd_gateway_host.as_str())
-                .build_d14n()?)
-        } else {
-            trace!(url = %network,  "create grpc");
-            Ok(builder.build_v3()?)
-        }
+        let bundle = self.client_bundle()?;
+        Ok(builder.from_bundle(bundle)?)
     }
 
     pub fn client_bundle(&self) -> eyre::Result<xmtp_mls::XmtpClientBundle> {
@@ -384,8 +403,8 @@ impl BackendOpts {
         }
         if self.d14n {
             let xmtpd_gateway_host = self.xmtpd_gateway_url()?;
-            trace!(url = %network, xmtpd_gateway = %xmtpd_gateway_host, "create grpc");
             Ok(builder
+                .maybe_xmtpd_host(self.d14n_host.clone())
                 .gateway_host(xmtpd_gateway_host.as_str())
                 .build_d14n()?)
         } else {
@@ -648,5 +667,26 @@ mod tests {
             "http://custom:5052/",
             "explicit --xmtpd-gateway-url should override perf gateway"
         );
+    }
+
+    #[test]
+    fn metrics_flag_defaults_false() {
+        let opts = AppOpts::try_parse_from(["xdbg"]).expect("parses with no args");
+        assert!(!opts.metrics, "--metrics should default to false");
+    }
+
+    #[test]
+    fn metrics_flag_parses_when_present() {
+        let opts = AppOpts::try_parse_from(["xdbg", "--metrics"]).expect("parses with --metrics");
+        assert!(opts.metrics, "--metrics should set opts.metrics to true");
+    }
+
+    #[test]
+    fn metrics_flag_coexists_with_enable_migration_short_flag() {
+        // -m is --enable-migration on BackendOpts; --metrics must not collide.
+        let opts = AppOpts::try_parse_from(["xdbg", "--metrics", "-m"])
+            .expect("--metrics and -m should coexist");
+        assert!(opts.metrics);
+        assert!(opts.backend.enable_migration);
     }
 }

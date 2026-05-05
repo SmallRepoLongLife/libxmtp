@@ -38,6 +38,7 @@ use xmtp_mls_common::{
 use xmtp_proto::types::Cursor;
 use xmtp_proto::xmtp::mls::message_contents::{ContentTypeId, GroupUpdated, group_updated::Inbox};
 
+use xmtp_proto::types::GroupId;
 /// Create a group from a decrypted and decoded welcome message.
 /// If the group already exists in the store, overwrite the MLS state and do not update the group entry
 ///
@@ -208,7 +209,10 @@ where
         let group_id = staged_welcome.public_group().group_id();
         // try to load the group this welcome represents
         // defensive to avoid race conditions & duplicates
-        if db.find_group(group_id.as_slice())?.is_some() {
+        if db
+            .find_group(&GroupId::from(group_id.as_slice()))?
+            .is_some()
+        {
             // Fetch the original MLS group, rather than the one from the welcome
             let result = MlsGroup::new_cached(self.context.clone(), group_id.as_slice());
             if let Ok((group, _)) = result {
@@ -319,6 +323,9 @@ where
                 welcome.cursor,
             )?;
         }
+        // TODO(app-data-migration): post-bootstrap groups have no legacy
+        // GroupMetadata extension; route through a capability-aware
+        // helper before the bootstrap commit lands.
         let metadata =
             extract_group_metadata(staged_welcome.public_group().group_context().extensions())
                 .map_err(MetadataPermissionsError::from)?;
@@ -335,7 +342,7 @@ where
 
         // Extract group_id before consuming staged_welcome
         let group_id = staged_welcome.public_group().group_id().to_vec();
-        let existing_group = db.find_group(group_id.as_slice())?;
+        let existing_group = db.find_group(&GroupId::from(group_id.as_slice()))?;
 
         // Check if this is a re-add scenario:
         // - Self-removal (PendingRemove): user left voluntarily, then gets re-added
@@ -358,6 +365,10 @@ where
         )?;
         let dm_members = metadata.dm_members;
         let conversation_type = metadata.conversation_type;
+        // TODO(app-data-migration): same caveat as the `metadata`
+        // extraction above — `.ok()` swallows the missing-GMM error
+        // on post-bootstrap groups, silently defaulting downstream
+        // disappearing / min-protocol reads.
         let mutable_metadata = extract_group_mutable_metadata(&mls_group).ok();
         let disappearing_settings = mutable_metadata.as_ref().and_then(|metadata| {
             MlsGroup::<C>::conversation_message_disappearing_settings_from_extensions(metadata).ok()

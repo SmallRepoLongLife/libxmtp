@@ -1,14 +1,50 @@
 use std::{fmt, ops::Deref, str::FromStr};
 
 use bytes::Bytes;
+#[cfg(feature = "diesel")]
+use diesel::{
+    backend::Backend,
+    deserialize::{self, FromSql, FromSqlRow},
+    expression::AsExpression,
+    serialize::{self, IsNull, Output, ToSql},
+    sql_types::Binary,
+    sqlite::Sqlite,
+};
 use hex::FromHexError;
+use serde::{Deserialize, Serialize};
 
+/// The canonical group identifier.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(feature = "diesel", derive(AsExpression, FromSqlRow))]
+#[cfg_attr(feature = "diesel", diesel(sql_type = Binary))]
 pub struct GroupId(bytes::Bytes);
+
+impl Serialize for GroupId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for GroupId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Vec::<u8>::deserialize(d).map(GroupId::from)
+    }
+}
 
 impl GroupId {
     pub fn as_slice(&self) -> &[u8] {
         self.0.as_ref()
+    }
+
+    pub fn to_openmls(&self) -> openmls::group::GroupId {
+        openmls::group::GroupId::from_slice(self.as_ref())
+    }
+
+    pub fn random<R: openmls_traits::random::OpenMlsRand>(rand: &R) -> Self {
+        let bytes = rand
+            .random_vec(16)
+            .expect("OpenMlsRand failed to produce randomness for GroupId");
+        GroupId::from(bytes)
     }
 }
 
@@ -65,6 +101,45 @@ impl From<&[u8]> for GroupId {
     }
 }
 
+impl From<GroupId> for Vec<u8> {
+    fn from(id: GroupId) -> Vec<u8> {
+        id.0.into()
+    }
+}
+
+#[cfg(feature = "diesel")]
+impl ToSql<Binary, Sqlite> for GroupId
+where
+    [u8]: ToSql<Binary, Sqlite>,
+{
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Sqlite>) -> serialize::Result {
+        out.set_value(self.as_slice().to_vec());
+        Ok(IsNull::No)
+    }
+}
+
+#[cfg(feature = "diesel")]
+impl FromSql<Binary, Sqlite> for GroupId
+where
+    Vec<u8>: FromSql<Binary, Sqlite>,
+{
+    fn from_sql(bytes: <Sqlite as Backend>::RawValue<'_>) -> deserialize::Result<Self> {
+        Vec::<u8>::from_sql(bytes).map(GroupId::from)
+    }
+}
+
+impl From<&openmls::group::GroupId> for GroupId {
+    fn from(id: &openmls::group::GroupId) -> Self {
+        GroupId::from(id.as_slice())
+    }
+}
+
+impl From<openmls::group::GroupId> for GroupId {
+    fn from(id: openmls::group::GroupId) -> Self {
+        GroupId::from(id.as_slice())
+    }
+}
+
 xmtp_common::if_test! {
     impl xmtp_common::Generate for GroupId {
         fn generate() -> Self {
@@ -110,5 +185,13 @@ mod test {
         let data = vec![0x12, 0x34, 0xab, 0xcd];
         assert!(format!("{}", GroupId::from(data.clone())).contains("1234abcd"));
         assert!(format!("{:?}", GroupId::from(data)).contains("GroupId"));
+    }
+
+    #[xmtp_common::test]
+    fn test_to_openmls_roundtrip() {
+        let bytes: [u8; 16] = xmtp_common::rand_vec::<16>().try_into().unwrap();
+        let xmtp_id = GroupId::from(bytes.as_slice());
+        let ommls_id = xmtp_id.to_openmls();
+        assert_eq!(ommls_id.as_slice(), xmtp_id.as_slice());
     }
 }

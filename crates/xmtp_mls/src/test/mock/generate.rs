@@ -7,7 +7,10 @@ use xmtp_proto::types::Cursor;
 use crate::{
     builder::DeviceSyncMode,
     client::DeviceSync,
-    groups::{mls_sync::GroupMessageProcessingError, summary::ProcessSummary},
+    groups::{
+        mls_sync::GroupMessageProcessingError,
+        summary::{MessageIdentifier, ProcessSummary, SyncSummary},
+    },
     worker::tasks::TaskWorkerChannels,
 };
 
@@ -105,10 +108,49 @@ pub fn generate_errored_summary(error_cursors: &[u64], successful_cursors: &[u64
     }
 }
 
+/// Like `generate_errored_summary`, but every success `MessageIdentifier` shares `group_id`
+/// (matches production sync summaries). Random per-message group ids break stream recovery tests.
+pub fn generate_errored_summary_with_group(
+    group_id: &[u8],
+    error_cursors: &[u64],
+    successful_cursors: &[u64],
+) -> SyncSummary {
+    SyncSummary {
+        publish_errors: vec![],
+        process: ProcessSummary {
+            total_messages: HashSet::from_iter(
+                error_cursors
+                    .iter()
+                    .copied()
+                    .chain(successful_cursors.iter().copied())
+                    .map(Cursor::v3_messages),
+            ),
+            new_messages: successful_cursors
+                .iter()
+                .map(|c| {
+                    let m = generate_message(*c, group_id);
+                    MessageIdentifier::from(&m)
+                })
+                .collect(),
+            errored: error_cursors
+                .iter()
+                .map(|c| {
+                    (
+                        Cursor::v3_messages(*c),
+                        GroupMessageProcessingError::InvalidPayload,
+                    )
+                })
+                .collect(),
+        },
+        post_commit_errors: vec![],
+        other: None,
+    }
+}
+
 pub fn generate_stored_msg(cursor: Cursor, group_id: Vec<u8>) -> StoredGroupMessage {
     StoredGroupMessage {
         id: xmtp_common::rand_vec::<32>(),
-        group_id,
+        group_id: group_id.into(),
         decrypted_message_bytes: b"test message".to_vec(),
         sent_at_ns: 100,
         kind: xmtp_db::group_message::GroupMessageKind::Application,

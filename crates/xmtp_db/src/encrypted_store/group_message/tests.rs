@@ -12,7 +12,10 @@ pub(crate) fn generate_message(
 ) -> StoredGroupMessage {
     StoredGroupMessage {
         id: rand_vec::<24>(),
-        group_id: group_id.map(<[u8]>::to_vec).unwrap_or(rand_vec::<24>()),
+        group_id: group_id
+            .map(<[u8]>::to_vec)
+            .unwrap_or(rand_vec::<24>())
+            .into(),
         decrypted_message_bytes: rand_vec::<24>(),
         sent_at_ns: sent_at_ns.unwrap_or(rand_time()),
         sender_installation_id: rand_vec::<24>(),
@@ -158,7 +161,7 @@ fn it_gets_many_messages() {
         }
 
         let count: i64 = conn
-            .raw_query_read(|raw_conn| {
+            .raw_query(|raw_conn| {
                 dsl::group_messages
                     .select(diesel::dsl::count_star())
                     .first(raw_conn)
@@ -580,7 +583,7 @@ pub(crate) fn generate_message_with_reference<C: ConnectionExt>(
 ) -> StoredGroupMessage {
     let message = StoredGroupMessage {
         id: rand_vec::<24>(),
-        group_id: group_id.to_vec(),
+        group_id: group_id.into(),
         decrypted_message_bytes: rand_vec::<24>(),
         sent_at_ns,
         sender_installation_id: rand_vec::<24>(),
@@ -1927,7 +1930,7 @@ fn test_count_group_messages_dm_vs_regular_groups() {
         regular_group.store(conn).unwrap();
 
         // Create identical message sets for both groups
-        let create_messages = |group_id: &Vec<u8>| {
+        let create_messages = |group_id: &[u8]| {
             vec![
                 generate_message(
                     Some(GroupMessageKind::Application),

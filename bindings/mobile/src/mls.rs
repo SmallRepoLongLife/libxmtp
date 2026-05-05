@@ -245,12 +245,10 @@ pub async fn get_newest_message_metadata(
     api: Arc<XmtpApiClient>,
     group_ids: Vec<Vec<u8>>,
 ) -> Result<HashMap<Vec<u8>, FfiMessageMetadata>, FfiError> {
-    let group_id_refs: Vec<&[u8]> = group_ids.iter().map(|id| id.as_slice()).collect();
+    let group_ids: Vec<xmtp_proto::types::GroupId> =
+        group_ids.into_iter().map(Into::into).collect();
 
-    let metadata = api
-        .wrapper
-        .get_newest_message_metadata(group_id_refs)
-        .await?;
+    let metadata = api.wrapper.get_newest_message_metadata(&group_ids).await?;
 
     metadata
         .into_iter()
@@ -888,11 +886,20 @@ impl FfiXmtpClient {
     pub async fn register_identity(
         &self,
         signature_request: Arc<FfiSignatureRequest>,
+        visibility_confirmation_options: Option<FfiVisibilityConfirmationOptions>,
     ) -> Result<(), FfiError> {
-        let signature_request = signature_request.inner.lock().await;
-        self.inner_client
-            .register_identity(signature_request.clone())
-            .await?;
+        {
+            let signature_request = signature_request.inner.lock().await;
+            self.inner_client
+                .register_identity(signature_request.clone())
+                .await?;
+        }
+
+        if let Some(opts) = visibility_confirmation_options {
+            self.inner_client
+                .wait_for_registration_visible(opts.into())
+                .await?;
+        }
 
         Ok(())
     }
@@ -1018,6 +1025,21 @@ impl FfiXmtpClient {
             scw_verifier: self.inner_client.scw_verifier().clone(),
         }))
     }
+
+    /// Wait until this client's registration is visible on the network.
+    ///
+    /// `options` controls the quorum, timeout, and polling interval.
+    /// Pass `None` to use the defaults (50% quorum, 30s timeout, 500ms interval).
+    pub async fn wait_for_registration_visible(
+        &self,
+        options: Option<FfiVisibilityConfirmationOptions>,
+    ) -> Result<(), FfiError> {
+        self.inner_client
+            .wait_for_registration_visible(options.unwrap_or_default().into())
+            .await?;
+
+        Ok(())
+    }
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
@@ -1040,6 +1062,40 @@ impl From<HmacKey> for FfiHmacKey {
         Self {
             epoch: value.epoch,
             key: value.key.to_vec(),
+        }
+    }
+}
+
+/// Options for `wait_for_registration_visible`.
+///
+/// All fields are optional. Omitted fields use their default values:
+/// - `quorum_percentage` / `quorum_absolute`: 1 node (`quorum_absolute` takes precedence if both are provided)
+/// - `timeout_ms`: 30 000 ms
+#[derive(uniffi::Record, Default)]
+pub struct FfiVisibilityConfirmationOptions {
+    /// Fraction of nodes that must confirm (e.g. 0.5 = 50 %).
+    pub quorum_percentage: Option<f32>,
+    /// Exact number of nodes that must confirm. Takes precedence over `quorum_percentage`.
+    pub quorum_absolute: Option<u64>,
+    /// How long to wait in total before returning an error (milliseconds).
+    pub timeout_ms: Option<u64>,
+}
+
+impl From<FfiVisibilityConfirmationOptions>
+    for xmtp_mls::registration_visible::VisibilityConfirmationOptions
+{
+    fn from(opts: FfiVisibilityConfirmationOptions) -> Self {
+        use xmtp_mls::registration_visible::Quorum;
+
+        let defaults = Self::default();
+        let quorum = match (opts.quorum_absolute, opts.quorum_percentage) {
+            (Some(n), _) => Quorum::Absolute(n as usize),
+            (_, Some(p)) => Quorum::percentage(p),
+            _ => defaults.quorum,
+        };
+        Self {
+            quorum,
+            timeout_ms: opts.timeout_ms.unwrap_or(defaults.timeout_ms),
         }
     }
 }
@@ -1838,7 +1894,7 @@ impl FfiConversations {
 
         let mut hmac_map = HashMap::new();
         for conversation in conversations {
-            let id = conversation.group_id.clone();
+            let id = conversation.group_id.to_vec();
             let keys = conversation
                 .hmac_keys(-1..=1)?
                 .into_iter()
@@ -2679,7 +2735,7 @@ impl FfiConversation {
         let close_cb = message_callback.clone();
         let handle = MlsGroup::stream_with_callback(
             self.inner.context.clone(),
-            self.id(),
+            self.inner.group_id.clone(),
             move |message| match message {
                 Ok(m) => message_callback.on_message(m.into()),
                 Err(e) => message_callback.on_error(e.into()),
@@ -2738,7 +2794,7 @@ impl FfiConversation {
 
         let mut hmac_map = HashMap::new();
         for conversation in duplicate_dms {
-            let id = conversation.group_id.clone();
+            let id = conversation.group_id.to_vec();
             let keys = conversation
                 .hmac_keys(-1..=1)?
                 .into_iter()
@@ -2783,7 +2839,7 @@ impl FfiConversation {
 #[uniffi::export]
 impl FfiConversation {
     pub fn id(&self) -> Vec<u8> {
-        self.inner.group_id.clone()
+        self.inner.group_id.to_vec()
     }
 
     pub fn conversation_type(&self) -> FfiConversationType {
@@ -3248,7 +3304,7 @@ impl From<StoredGroupMessage> for FfiMessage {
         Self {
             id: msg.id,
             sent_at_ns: msg.sent_at_ns,
-            conversation_id: msg.group_id,
+            conversation_id: msg.group_id.into(),
             sender_inbox_id: msg.sender_inbox_id,
             content: msg.decrypted_message_bytes,
             kind: msg.kind.into(),

@@ -107,6 +107,7 @@ use xmtp_db::{
 use xmtp_id::{InboxId, InboxIdRef};
 use xmtp_mls_common::group_metadata::extract_group_metadata;
 use xmtp_mls_common::group_mutable_metadata::{MetadataField, extract_group_mutable_metadata};
+use xmtp_proto::types::GroupId;
 use xmtp_proto::xmtp::mls::message_contents::content_types::DeleteMessage;
 use xmtp_proto::xmtp::mls::{
     api::v1::{
@@ -156,6 +157,17 @@ pub enum GroupMessageProcessingError {
     #[error("openmls process message error: {0}")]
     OpenMlsProcessMessage(
         #[from] openmls::prelude::ProcessMessageError<sql_key_store::SqlKeyStoreError>,
+    ),
+    /// AppDataUpdate-aware processing wrapper error.
+    ///
+    /// Wraps the same `ProcessMessageError` as the variant above, plus the
+    /// `ComponentSourceError` that fires when an incoming `AppDataUpdate`
+    /// payload can't be decoded under our wire format. Kept distinct from
+    /// `OpenMlsProcessMessage` so the AppData-decode failure mode is
+    /// greppable in logs.
+    #[error("app-data process message error: {0}")]
+    OpenMlsProcessMessageWithAppData(
+        #[from] super::app_data::ProcessMessageWithAppDataError<sql_key_store::SqlKeyStoreError>,
     ),
     #[error("merge staged commit: {0}")]
     MergeStagedCommit(#[from] openmls::group::MergeCommitError<sql_key_store::SqlKeyStoreError>),
@@ -214,6 +226,12 @@ impl RetryableError for GroupMessageProcessingError {
             Self::Diesel(err) => err.is_retryable(),
             Self::Identity(err) => err.is_retryable(),
             Self::OpenMlsProcessMessage(err) => err.is_retryable(),
+            Self::OpenMlsProcessMessageWithAppData(err) => match err {
+                super::app_data::ProcessMessageWithAppDataError::OpenMls(e) => e.is_retryable(),
+                // Decode failures are wire-format violations from the
+                // peer — retrying won't help.
+                super::app_data::ProcessMessageWithAppDataError::AppDataDecode(_) => false,
+            },
             Self::MergeStagedCommit(err) => err.is_retryable(),
             Self::ProcessIntent(err) => err.is_retryable(),
             Self::CommitValidation(err) => err.is_retryable(),
@@ -249,10 +267,28 @@ impl RetryableError for GroupMessageProcessingError {
 
 impl GroupMessageProcessingError {
     pub(crate) fn commit_result(&self) -> CommitResult {
+        use super::app_data::ProcessMessageWithAppDataError;
         match self {
             GroupMessageProcessingError::OpenMlsProcessMessage(
                 ProcessMessageError::ValidationError(ValidationError::WrongEpoch),
             ) => CommitResult::WrongEpoch,
+            // Treat the AppData-aware wrapper the same as the bare
+            // OpenMLS error: if it carries a ValidationError(WrongEpoch),
+            // surface as WrongEpoch; if it carries any other OpenMLS
+            // error, surface as Undecryptable. Decode failures (the
+            // AppData-side variant) are treated as Invalid because they
+            // mean the peer's wire format was wrong.
+            GroupMessageProcessingError::OpenMlsProcessMessageWithAppData(
+                ProcessMessageWithAppDataError::OpenMls(ProcessMessageError::ValidationError(
+                    ValidationError::WrongEpoch,
+                )),
+            ) => CommitResult::WrongEpoch,
+            GroupMessageProcessingError::OpenMlsProcessMessageWithAppData(
+                ProcessMessageWithAppDataError::OpenMls(_),
+            ) => CommitResult::Undecryptable,
+            GroupMessageProcessingError::OpenMlsProcessMessageWithAppData(
+                ProcessMessageWithAppDataError::AppDataDecode(_),
+            ) => CommitResult::Invalid,
             GroupMessageProcessingError::OldEpoch(_, _) => CommitResult::WrongEpoch,
             GroupMessageProcessingError::FutureEpoch(_, _) => CommitResult::WrongEpoch,
             GroupMessageProcessingError::CommitValidation(_) => CommitResult::Invalid,
@@ -344,8 +380,11 @@ where
 
     fn handle_group_paused(&self) -> Result<(), GroupError> {
         // Check if group is paused and try to unpause if version requirements are met
-        if let Some(required_min_version_str) =
-            self.context.db().get_group_paused_version(&self.group_id)?
+        let group_id_typed = self.group_id.clone();
+        if let Some(required_min_version_str) = self
+            .context
+            .db()
+            .get_group_paused_version(&group_id_typed)?
         {
             tracing::info!(
                 "Group is paused until version: {}",
@@ -361,7 +400,7 @@ where
                      Group ID: {}",
                     hex::encode(&self.group_id),
                 );
-                self.context.db().unpause_group(&self.group_id)?;
+                self.context.db().unpause_group(&group_id_typed)?;
             } else {
                 tracing::warn!(
                     "Skipping sync for paused group since version requirements are not met. \
@@ -675,7 +714,8 @@ where
             | IntentKind::MetadataUpdate
             | IntentKind::UpdatePermission
             | IntentKind::ReaddInstallations
-            | IntentKind::CommitPendingProposals => {
+            | IntentKind::CommitPendingProposals
+            | IntentKind::BootstrapMigration => {
                 if let Some(published_in_epoch) = intent.published_in_epoch {
                     let group_epoch = group_epoch.as_u64() as i64;
                     let message_epoch = message_epoch.as_u64() as i64;
@@ -1010,7 +1050,11 @@ where
         let result = provider.key_store().transaction(|conn| {
             let storage = conn.key_store();
             let provider = XmtpOpenMlsProvider::new(storage);
-            processed_message = Some(mls_group.process_message(&provider, message.clone()));
+            processed_message = Some(super::app_data::process_message_with_app_data(
+                mls_group,
+                &provider,
+                message.clone(),
+            ));
             // Rollback the transaction. We want to synchronize with the server before committing.
             Err::<(), StorageError>(StorageError::IntentionalRollback)
         });
@@ -1090,6 +1134,10 @@ where
                         return Err(CommitValidationError::from(e).into());
                     }
                 };
+                // TODO(app-data-migration): these legacy extractors
+                // fail on post-bootstrap groups (GMM / GroupMetadata
+                // extensions are stripped). Unmigrated groups — the
+                // only ones in production today — are unaffected.
                 let immutable_metadata = match extract_group_metadata(extensions) {
                     Ok(m) => m,
                     Err(e) => {
@@ -1174,7 +1222,11 @@ where
                 return identifier.build();
             }
             // once the checks for processing pass, actually process the message
-            let processed_message = mls_group.process_message(&provider, message.clone())?;
+            let processed_message = super::app_data::process_message_with_app_data(
+                mls_group,
+                &provider,
+                message.clone(),
+            )?;
             let identifier = self.process_external_message(
                 mls_group,
                 processed_message,
@@ -1444,20 +1496,12 @@ where
             return;
         };
 
-        match crate::messages::decoded_message::DecodedMessage::try_from(original_msg) {
-            Ok(decoded_message) => {
-                let _ = self.context.local_events().send(
-                    crate::subscriptions::LocalEvents::MessageDeleted(Box::new(decoded_message)),
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    message_id = hex::encode(&deletion.deleted_message_id),
-                    error = ?e,
-                    "Failed to decode deleted message for deletion event"
-                );
-            }
-        }
+        let _ = self
+            .context
+            .local_events()
+            .send(crate::subscriptions::LocalEvents::MsgsDeleted(vec![
+                original_msg,
+            ]));
     }
 
     fn process_leave_request_message(
@@ -1532,7 +1576,7 @@ where
         let original_msg_opt = storage.db().get_group_message(&target_message_id)?;
 
         let is_super_admin_deletion = if let Some(ref original_msg) = original_msg_opt {
-            if original_msg.group_id != self.group_id {
+            if original_msg.group_id.as_slice() != self.group_id.as_slice() {
                 tracing::warn!(
                     "Cross-group deletion attempt: message {} from group {}",
                     delete_msg.message_id,
@@ -1590,22 +1634,12 @@ where
 
         let out_of_order = original_msg_opt.is_none();
         if let Some(original_msg) = original_msg_opt {
-            match crate::messages::decoded_message::DecodedMessage::try_from(original_msg) {
-                Ok(decoded_message) => {
-                    let _ = self.context.local_events().send(
-                        crate::subscriptions::LocalEvents::MessageDeleted(Box::new(
-                            decoded_message,
-                        )),
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        message_id = hex::encode(&target_message_id),
-                        error = ?e,
-                        "Failed to decode deleted message for deletion event"
-                    );
-                }
-            }
+            let _ =
+                self.context
+                    .local_events()
+                    .send(crate::subscriptions::LocalEvents::MsgsDeleted(vec![
+                        original_msg,
+                    ]));
         }
 
         tracing::info!(
@@ -1646,7 +1680,7 @@ where
         }
         let pending_remove_users = storage
             .db()
-            .get_pending_remove_users(&mls_group.group_id().to_vec())?;
+            .get_pending_remove_users(&GroupId::from(mls_group.group_id().as_slice()))?;
         if pending_remove_users.is_empty() {
             return Ok(());
         }
@@ -1724,7 +1758,7 @@ where
             // Promoted to super_admin: check if there are pending remove users
             match storage
                 .db()
-                .get_pending_remove_users(&mls_group.group_id().to_vec())
+                .get_pending_remove_users(&GroupId::from(mls_group.group_id().as_slice()))
             {
                 Ok(pending_remove_users) => {
                     if !pending_remove_users.is_empty()
@@ -1795,13 +1829,13 @@ where
 
     pub(crate) fn mark_readd_requests_as_responded(
         storage: &impl XmtpMlsStorageProvider,
-        group_id: &Vec<u8>,
+        group_id: &GroupId,
         readded_installations: &HashSet<Vec<u8>>,
         cursor: i64,
     ) -> Result<(), StorageError> {
         for installation_id in readded_installations {
             storage.db().update_responded_at_sequence_id(
-                group_id.as_slice(),
+                group_id,
                 installation_id.as_slice(),
                 cursor,
             )?;
@@ -1810,6 +1844,9 @@ where
     }
 
     fn get_message_expire_at_ns(mls_group: &OpenMlsGroup) -> Option<i64> {
+        // TODO(app-data-migration): on post-bootstrap groups the legacy
+        // GMM extension is gone; `.ok()?` will silently disable
+        // message-disappear settings.
         let mutable_metadata = extract_group_mutable_metadata(mls_group).ok()?;
         let group_disappearing_settings =
             Self::conversation_message_disappearing_settings_from_extensions(&mutable_metadata)
@@ -2070,13 +2107,13 @@ where
             match data.field_name.as_str() {
                 field_name if field_name == MetadataField::MessageDisappearFromNS.as_str() => {
                     storage.db().update_message_disappearing_from_ns(
-                        self.group_id.clone(),
+                        &self.group_id,
                         data.field_value.parse::<i64>().ok(),
                     )?
                 }
                 field_name if field_name == MetadataField::MessageDisappearInNS.as_str() => {
                     storage.db().update_message_disappearing_in_ns(
-                        self.group_id.clone(),
+                        &self.group_id,
                         data.field_value.parse::<i64>().ok(),
                     )?
                 }
@@ -2101,7 +2138,7 @@ where
                         .and_then(|v| v.parse::<i64>().ok());
                     storage
                         .db()
-                        .update_message_disappearing_from_ns(self.group_id.clone(), parsed_value)?
+                        .update_message_disappearing_from_ns(&self.group_id, parsed_value)?
                 }
                 field_name if field_name == MetadataField::MessageDisappearInNS.as_str() => {
                     let parsed_value = change
@@ -2110,7 +2147,7 @@ where
                         .and_then(|v| v.parse::<i64>().ok());
                     storage
                         .db()
-                        .update_message_disappearing_in_ns(self.group_id.clone(), parsed_value)?
+                        .update_message_disappearing_in_ns(&self.group_id, parsed_value)?
                 }
                 _ => {} // Handle other metadata updates if needed
             }
@@ -2301,9 +2338,7 @@ where
         let sender_installation_id = validated_commit.actor_installation_id();
         let sender_inbox_id = validated_commit.actor_inbox_id();
 
-        let pending_remove_users = &storage
-            .db()
-            .get_pending_remove_users(self.group_id.as_slice())?;
+        let pending_remove_users = &storage.db().get_pending_remove_users(&self.group_id)?;
         let payload: GroupUpdated = validated_commit.into_with(pending_remove_users);
         tracing::info!("Storing transcript message");
         let encoded_payload = GroupUpdatedCodec::encode(payload.clone())?;
@@ -2555,21 +2590,7 @@ where
                                     err = ?err
                                 );
 
-                                if (intent.publish_attempts + 1) as usize >= MAX_INTENT_PUBLISH_ATTEMPTS {
-                                    tracing::error!(
-                                        intent.id,
-                                        intent.kind = %intent.kind,
-                                        inbox_id = self.context.inbox_id(),
-                                        installation_id = %self.context.installation_id(),group_id = hex::encode(&self.group_id),
-                                        "intent {} has reached max publish attempts", intent.id);
-                                    // TODO: Eventually clean up errored attempts
-                                    let id = utils::id::calculate_message_id_for_intent(&intent)?;
-                                    db.set_group_intent_error_and_fail_msg(&intent, id)?;
-                                } else {
-                                    // Reset so the next retry re-encrypts at the current epoch.
-                                    db.increment_intent_publish_attempt_count(intent.id)?;
-                                    db.set_group_intent_to_publish(intent.id)?;
-                                }
+                                handle_published_intent_send_failure(&db, &intent)?;
                                 return Err(err)?;
                             }
                             (kind, Ok(_)) => {
@@ -2668,6 +2689,90 @@ where
             }
             IntentKind::MetadataUpdate => {
                 let metadata_intent = UpdateMetadataIntentData::try_from(intent.data.clone())?;
+
+                // Gate the AppDataUpdate path on both the capability flag
+                // AND a non-empty component registry. The registry check
+                // keeps unmigrated groups on the legacy path so a sender
+                // doesn't publish commits that the receiver would deny
+                // (`NoRegistryEntry`) against an empty registry.
+                let proposals_on = self.proposals_enabled(openmls_group);
+                let registry_populated =
+                    !super::app_data::load_component_registry(openmls_group)?.is_empty();
+                // DEBUG-level routing trace so operators can see which
+                // groups are on which path during the rollout — especially
+                // useful if the migration ships only partially and we need
+                // to know how many groups are still on the legacy path.
+                // INFO would spam every metadata update; DEBUG keeps it
+                // opt-in for on-demand investigation.
+                tracing::debug!(
+                    group_id = hex::encode(self.group_id.as_slice()),
+                    proposals_enabled = proposals_on,
+                    registry_populated,
+                    path = if proposals_on && registry_populated {
+                        "app_data_update"
+                    } else {
+                        "legacy_gce"
+                    },
+                    "MetadataUpdate intent routing"
+                );
+                if proposals_on && registry_populated {
+                    // Bundle the AppDataUpdate proposal and its resulting
+                    // dict update into a single commit so propose-and-apply
+                    // stays atomic — matching the legacy GCE path's
+                    // "metadata update completes in one sync" semantics.
+                    use super::app_data::{
+                        component_source::{
+                            ComponentMutation, ComponentSourceError,
+                            encode_app_data_update_payload, metadata_field_to_component_id,
+                        },
+                        stage_inline_app_data_commit,
+                    };
+
+                    let component_id = metadata_field_to_component_id(&metadata_intent.field_name)
+                        .ok_or_else(|| {
+                            GroupError::ComponentSource(ComponentSourceError::UnknownMetadataField(
+                                metadata_intent.field_name.clone(),
+                            ))
+                        })?;
+
+                    let payload = encode_app_data_update_payload(&ComponentMutation::Bytes {
+                        component_id,
+                        new_value: metadata_intent.field_value.as_bytes(),
+                    })?;
+
+                    let signer = self.context.identity().installation_keys.clone();
+                    let (bundle, staged_commit, group_epoch) = generate_commit_with_rollback(
+                        storage,
+                        openmls_group,
+                        move |group, provider| -> Result<_, GroupError> {
+                            Ok(stage_inline_app_data_commit(
+                                group,
+                                provider,
+                                &signer,
+                                component_id,
+                                payload,
+                            )?)
+                        },
+                    )?;
+
+                    let (commit, welcome, _group_info) = bundle.into_messages();
+                    // A metadata-only AppDataUpdate commit has no add/remove
+                    // proposals, so OpenMLS should never synthesize a welcome
+                    // alongside it. If that ever changes, dropping it here
+                    // would silently strand installations that expected one.
+                    debug_assert!(
+                        welcome.is_none(),
+                        "MetadataUpdate via AppDataUpdate must not produce a welcome"
+                    );
+                    return Ok(Some(PublishIntentData {
+                        payloads_to_publish: vec![commit.tls_serialize_detached()?],
+                        staged_commit,
+                        post_commit_action: None,
+                        should_send_push_notification: intent.should_push,
+                        group_epoch,
+                    }));
+                }
+
                 let mutable_metadata_extensions = build_extensions_for_metadata_update(
                     openmls_group,
                     metadata_intent.field_name,
@@ -2695,6 +2800,10 @@ where
                 }))
             }
             IntentKind::UpdateAdminList => {
+                // ADMIN_LIST stays on the legacy GCE path: routing it
+                // through AppDataUpdate would let the GMM-backed validators
+                // in `validated_commit.rs` diverge from the dict until the
+                // migration is dual-write or complete.
                 let admin_list_update_intent =
                     UpdateAdminListIntentData::try_from(intent.data.clone())?;
                 let mutable_metadata_extensions = build_extensions_for_admin_lists_update(
@@ -2877,20 +2986,27 @@ where
             IntentKind::ProposeGroupContextExtensions => {
                 // No proposals_enabled guard here — ProposeGroupContextExtensions is used
                 // by enable_proposals() to bootstrap proposal support on the group.
+                //
+                // This arm handles the legacy propose-by-reference flow
+                // only. The one-time AppData-migration bootstrap commit
+                // is routed through [`IntentKind::BootstrapMigration`]
+                // instead — keep them distinct so the commit-producing
+                // path never fires accidentally when a caller just
+                // wants a standalone GCE proposal.
                 let intent_data =
                     ProposeGroupContextExtensionsIntentData::try_from(intent.data.as_slice())?;
                 let group_epoch = openmls_group.epoch().as_u64();
 
                 // Deserialize the extensions using tls_codec
                 use openmls::prelude::tls_codec::Deserialize;
-                let extensions =
+                let new_extensions =
                     Extensions::tls_deserialize(&mut intent_data.extensions_bytes.as_slice())?;
 
                 let signer = &self.context.identity().installation_keys;
                 let (proposal_msg, _proposal_ref) = openmls_group
                     .propose_group_context_extensions(
                         &self.context.mls_provider(),
-                        extensions,
+                        new_extensions,
                         signer,
                     )
                     .map_err(GroupError::Proposal)?;
@@ -2898,6 +3014,81 @@ where
                 Ok(Some(PublishIntentData {
                     payloads_to_publish: vec![proposal_msg.tls_serialize_detached()?],
                     staged_commit: None,
+                    post_commit_action: None,
+                    should_send_push_notification: intent.should_push,
+                    group_epoch,
+                }))
+            }
+            IntentKind::BootstrapMigration => {
+                // One-time AppData-migration bootstrap: bundles one
+                // GCE proposal (that strips the four legacy XMTP
+                // extensions and adds PROPOSAL_SUPPORT) with an
+                // `AppDataUpdate` proposal per well-known component.
+                // Routed on an explicit [`IntentKind::BootstrapMigration`]
+                // rather than shape-sniffing `ProposeGroupContextExtensions`
+                // payloads so a future non-bootstrap GCE intent with
+                // similar extension shape can't accidentally trigger
+                // the bootstrap path.
+                //
+                // NOTE: honest receivers reject the bootstrap commit
+                // until the receiver-side validator that understands
+                // `COMPONENT_REGISTRY` / `GROUP_MEMBERSHIP` writes is
+                // wired. Emitting this intent is only useful when the
+                // validator lands in the same release.
+                let intent_data =
+                    ProposeGroupContextExtensionsIntentData::try_from(intent.data.as_slice())?;
+
+                use openmls::prelude::tls_codec::Deserialize;
+                let new_extensions =
+                    Extensions::tls_deserialize(&mut intent_data.extensions_bytes.as_slice())?;
+
+                // Synthesize component values (async — hits
+                // identity-update API for failed_installations
+                // partitioning). The read runs outside the
+                // rollback transaction below, which is fine because:
+                // (a) identity-updates are append-only so a concurrent
+                // write can't invalidate a snapshot we just read,
+                // (b) honest receivers re-derive identity from the
+                // bootstrap-commit AppDataUpdate bytes directly rather
+                // than running the same synthesis, so cross-peer
+                // byte-identity isn't at stake, and
+                // (c) if a concurrent intent (e.g.
+                // `UpdateGroupMembership`) commits between this
+                // synthesis and `stage_bootstrap_commit`, the staged
+                // commit fails with an epoch mismatch and the
+                // `BootstrapMigration` arm of the `OldEpoch` retry
+                // path republishes the intent — benign churn, not data
+                // loss. Worth noting in production monitoring under
+                // high concurrency.
+                let component_values =
+                    super::app_data::migration::synthesize_initial_component_values(
+                        &self.context,
+                        openmls_group,
+                    )
+                    .await?;
+
+                let signer = self.context.identity().installation_keys.clone();
+                let (bundle, staged_commit, group_epoch): (
+                    openmls::prelude::CommitMessageBundle,
+                    Option<Vec<u8>>,
+                    u64,
+                ) = generate_commit_with_rollback(
+                    storage,
+                    openmls_group,
+                    move |group, provider| -> Result<_, GroupError> {
+                        Ok(super::app_data::migration::stage_bootstrap_commit(
+                            group,
+                            provider,
+                            &signer,
+                            &component_values,
+                            new_extensions,
+                        )?)
+                    },
+                )?;
+                let (commit, _, _) = bundle.into_messages();
+                Ok(Some(PublishIntentData {
+                    payloads_to_publish: vec![commit.tls_serialize_detached()?],
+                    staged_commit,
                     post_commit_action: None,
                     should_send_push_notification: intent.should_push,
                     group_epoch,
@@ -3086,28 +3277,26 @@ where
                                     .map_err(GroupError::Proposal)?;
                                 let gce_payload = gce_msg.tls_serialize_detached()?;
 
-                                // Create commit consuming all proposals (including GCE)
-                                let bundle = group
-                                    .commit_builder()
-                                    .consume_proposal_store(true)
-                                    .load_psks(provider.storage())
-                                    .map_err(CommitToPendingProposalsError::from)?
-                                    .build(provider.rand(), provider.crypto(), &signer, |qp| {
-                                        match qp.proposal() {
-                                            Proposal::GroupContextExtensions(gce) => {
-                                                extract_group_membership(gce.extensions())
-                                                    .map(|m| {
-                                                        m.members
-                                                            == new_membership_for_filter.members
-                                                    })
-                                                    .unwrap_or(false)
-                                            }
-                                            _ => true,
+                                // Create commit consuming all proposals (including GCE).
+                                // `build_commit_with_pending_app_data_updates` pre-computes
+                                // the AppData dictionary writes from any queued
+                                // `AppDataUpdate` proposals so the commit builder can
+                                // apply them in lockstep. See plan §11.
+                                let bundle = build_commit_with_pending_app_data_updates(
+                                    group,
+                                    provider,
+                                    &signer,
+                                    |qp| match qp.proposal() {
+                                        Proposal::GroupContextExtensions(gce) => {
+                                            extract_group_membership(gce.extensions())
+                                                .map(|m| {
+                                                    m.members == new_membership_for_filter.members
+                                                })
+                                                .unwrap_or(false)
                                         }
-                                    })
-                                    .map_err(CommitToPendingProposalsError::from)?
-                                    .stage_commit(provider)
-                                    .map_err(CommitToPendingProposalsError::from)?;
+                                        _ => true,
+                                    },
+                                )?;
 
                                 Ok((gce_payload, bundle))
                             },
@@ -3152,35 +3341,29 @@ where
                     let (bundle, staged_commit, group_epoch) = generate_commit_with_rollback(
                         storage,
                         openmls_group,
-                        |group,
-                         provider|
-                         -> Result<
-                            _,
-                            CommitToPendingProposalsError<sql_key_store::SqlKeyStoreError>,
-                        > {
-                            Ok(group
-                                .commit_builder()
-                                .consume_proposal_store(true)
-                                .load_psks(provider.storage())?
-                                .build(provider.rand(), provider.crypto(), signer, |qp| {
-                                    match qp.proposal() {
-                                        Proposal::GroupContextExtensions(gce) => {
-                                            if !membership_changed {
-                                                // No membership changes: include all GCEs
-                                                return true;
-                                            }
-                                            // Only include GCE with correct membership
-                                            // (compare members only, not failed_installations)
-                                            extract_group_membership(gce.extensions())
-                                                .map(|m| {
-                                                    m.members == new_membership_for_filter.members
-                                                })
-                                                .unwrap_or(false)
+                        |group, provider| -> Result<_, GroupError> {
+                            // See plan §11 — this commit path also has to thread
+                            // queued `AppDataUpdate` proposals' dict writes in
+                            // lockstep with the commit build.
+                            build_commit_with_pending_app_data_updates(
+                                group,
+                                provider,
+                                signer,
+                                |qp| match qp.proposal() {
+                                    Proposal::GroupContextExtensions(gce) => {
+                                        if !membership_changed {
+                                            // No membership changes: include all GCEs
+                                            return true;
                                         }
-                                        _ => true,
+                                        // Only include GCE with correct membership
+                                        // (compare members only, not failed_installations)
+                                        extract_group_membership(gce.extensions())
+                                            .map(|m| m.members == new_membership_for_filter.members)
+                                            .unwrap_or(false)
                                     }
-                                })?
-                                .stage_commit(provider)?)
+                                    _ => true,
+                                },
+                            )
                         },
                     )?;
                     let (commit, maybe_welcome, _group_info) = bundle.into_messages();
@@ -3269,11 +3452,11 @@ where
         let interval_ns = update_interval_ns.unwrap_or(SYNC_UPDATE_INSTALLATIONS_INTERVAL_NS);
 
         let now_ns = xmtp_common::time::now_ns();
-        let last_ns = db.get_installations_time_checked(self.group_id.clone())?;
+        let last_ns = db.get_installations_time_checked(&self.group_id)?;
         let elapsed_ns = now_ns - last_ns;
         if elapsed_ns > interval_ns && self.is_active()? {
             self.add_missing_installations().await?;
-            db.update_installations_time_checked(self.group_id.clone())?;
+            db.update_installations_time_checked(&self.group_id)?;
         }
 
         Ok(())
@@ -3616,7 +3799,7 @@ where
                 key
             }
         };
-        ikm.extend(&self.group_id);
+        ikm.extend_from_slice(self.group_id.as_ref());
         let hkdf = Hkdf::<Sha256>::new(Some(HMAC_SALT), &ikm);
 
         let mut result = vec![];
@@ -3624,7 +3807,7 @@ where
         for delta in epoch_delta_range {
             let epoch = current_epoch + delta;
 
-            let mut info = self.group_id.clone();
+            let mut info = self.group_id.to_vec();
             info.extend(&epoch.to_le_bytes());
 
             let mut key = [0; 42];
@@ -3903,10 +4086,73 @@ where
     Ok((operation_result, staged_commit, group_epoch))
 }
 
+/// Build a commit bundle that consumes all pending proposals and
+/// pre-computes any AppData dictionary writes required by queued
+/// `AppDataUpdate` proposals.
+///
+/// Any commit that consumes the proposal store must route through this
+/// helper so OpenMLS's `apply_app_data_update_proposals` sees the dict
+/// writes the queued `AppDataUpdate` proposals expect — otherwise the
+/// build fails with `MissingAppDataUpdates`. Callers provide a
+/// `proposal_filter` so the business logic (e.g. "only include a GCE
+/// whose membership matches the one we're about to apply") stays at
+/// the call site.
+fn build_commit_with_pending_app_data_updates<P, F>(
+    group: &mut OpenMlsGroup,
+    provider: &P,
+    signer: &impl openmls_traits::signatures::Signer,
+    proposal_filter: F,
+) -> Result<openmls::prelude::CommitMessageBundle, GroupError>
+where
+    P: OpenMlsProvider,
+    P::StorageProvider:
+        openmls_traits::storage::StorageProvider<1, Error = sql_key_store::SqlKeyStoreError>,
+    F: FnMut(&openmls::group::QueuedProposal) -> bool,
+{
+    let app_data_updates = super::app_data::pending_app_data_updates(group)?;
+
+    let mut stage = group
+        .commit_builder()
+        .consume_proposal_store(true)
+        .load_psks(provider.storage())
+        .map_err(CommitToPendingProposalsError::from)?;
+    stage.with_app_data_dictionary_updates(app_data_updates);
+
+    let bundle = stage
+        .build(provider.rand(), provider.crypto(), signer, proposal_filter)
+        .map_err(CommitToPendingProposalsError::from)?
+        .stage_commit(provider)
+        .map_err(CommitToPendingProposalsError::from)?;
+
+    Ok(bundle)
+}
+
 pub(crate) fn decode_staged_commit(
     data: &[u8],
 ) -> Result<StagedCommit, GroupMessageProcessingError> {
     Ok(xmtp_db::db_deserialize(data)?)
+}
+
+fn handle_published_intent_send_failure<Db: QueryGroupIntent>(
+    db: &Db,
+    intent: &StoredGroupIntent,
+) -> Result<(), GroupError> {
+    if (intent.publish_attempts + 1) as usize >= MAX_INTENT_PUBLISH_ATTEMPTS {
+        tracing::error!(
+            intent.id,
+            intent.kind = %intent.kind,
+            "intent {} has reached max publish attempts",
+            intent.id
+        );
+        let id = utils::id::calculate_message_id_for_intent(intent)?;
+        db.set_group_intent_error_and_fail_msg(intent, id)?;
+    } else {
+        // Reset so the next retry re-encrypts at the current epoch.
+        db.increment_intent_publish_attempt_count(intent.id)?;
+        db.set_group_intent_to_publish(intent.id)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3914,8 +4160,10 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::{builder::ClientBuilder, utils::TestMlsGroup};
+    use mockall::predicate::eq;
     use std::sync::Arc;
     use xmtp_cryptography::utils::generate_local_wallet;
+    use xmtp_db::mock::MockDbQuery;
 
     /// This test is not reproducible in webassembly, b/c webassembly has only one thread.
     #[cfg_attr(
@@ -3989,6 +4237,38 @@ pub(crate) mod tests {
         assert_eq!(hmac_keys[0].epoch, current_epoch - 1);
         assert_eq!(hmac_keys[1].epoch, current_epoch);
         assert_eq!(hmac_keys[2].epoch, current_epoch + 1);
+    }
+
+    #[test]
+    fn send_failures_for_published_intents_revert_to_to_publish() {
+        let intent = StoredGroupIntent {
+            id: 42,
+            kind: IntentKind::SendMessage,
+            group_id: GroupId::from(xmtp_common::rand_vec::<16>()),
+            data: Vec::new(),
+            state: IntentState::Published,
+            payload_hash: Some(xmtp_common::rand_vec::<32>()),
+            post_commit_data: None,
+            publish_attempts: 0,
+            staged_commit: None,
+            published_in_epoch: Some(7),
+            should_push: false,
+            sequence_id: None,
+            originator_id: None,
+        };
+
+        let mut db = MockDbQuery::new();
+        db.expect_increment_intent_publish_attempt_count()
+            .with(eq(intent.id))
+            .times(1)
+            .returning(|_| Ok(()));
+        db.expect_set_group_intent_to_publish()
+            .with(eq(intent.id))
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let result = handle_published_intent_send_failure(&db, &intent);
+        assert!(result.is_ok());
     }
 
     /// Test that process_delete_message handles completely malformed bytes gracefully
@@ -4179,6 +4459,45 @@ pub(crate) mod tests {
         assert!(
             result.is_ok(),
             "Invalid hex message_id should not cause error"
+        );
+    }
+
+    /// Pin the `CommitResult` mapping for each arm of the AppData-aware
+    /// wrapper error so future refactors of `commit_result()` can't
+    /// silently reshuffle what a receiver will write to the remote
+    /// commit log. In particular: `AppDataDecode` failures must be
+    /// `Invalid` (non-retriable wire-format violation), not
+    /// `Undecryptable` (retriable transport failure).
+    #[test]
+    fn process_message_with_app_data_error_commit_result_mapping() {
+        use super::super::app_data::ProcessMessageWithAppDataError;
+        use super::super::app_data::component_source::ComponentSourceError;
+        use openmls::group::ValidationError;
+
+        let wrong_epoch = GroupMessageProcessingError::OpenMlsProcessMessageWithAppData(
+            ProcessMessageWithAppDataError::OpenMls(ProcessMessageError::ValidationError(
+                ValidationError::WrongEpoch,
+            )),
+        );
+        assert_eq!(wrong_epoch.commit_result(), CommitResult::WrongEpoch);
+
+        let other_openmls = GroupMessageProcessingError::OpenMlsProcessMessageWithAppData(
+            ProcessMessageWithAppDataError::OpenMls(ProcessMessageError::IncompatibleWireFormat),
+        );
+        assert_eq!(other_openmls.commit_result(), CommitResult::Undecryptable);
+
+        // AppData decode failures are deterministic wire-format violations:
+        // retrying the same bytes can't fix them, and the receiver should
+        // log them as `Invalid` rather than `Undecryptable`.
+        let decode_failure = GroupMessageProcessingError::OpenMlsProcessMessageWithAppData(
+            ProcessMessageWithAppDataError::AppDataDecode(ComponentSourceError::UnknownComponent(
+                xmtp_mls_common::app_data::component_id::ComponentId::from(0u16),
+            )),
+        );
+        assert_eq!(decode_failure.commit_result(), CommitResult::Invalid);
+        assert!(
+            !decode_failure.is_retryable(),
+            "wire-format violations must not be retriable"
         );
     }
 }

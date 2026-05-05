@@ -13,12 +13,11 @@ use diesel::{
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use xmtp_common::fmt;
-use xmtp_proto::types::Cursor;
+use xmtp_proto::types::{Cursor, GroupId};
 
 use super::{
     ConnectionExt, Sqlite,
     db_connection::DbConnection,
-    group,
     schema::group_intents::{self, dsl},
 };
 use crate::{
@@ -46,6 +45,15 @@ pub enum IntentKind {
     ProposeMemberUpdate = 8,
     ProposeGroupContextExtensions = 9,
     CommitPendingProposals = 10,
+    /// One-time bootstrap commit that flips a group from the legacy
+    /// GroupContextExtensions-backed metadata layout onto the AppData
+    /// dictionary. Distinct from [`Self::ProposeGroupContextExtensions`]
+    /// because the payload shape is different (it bundles a GCE proposal
+    /// with a fan-out of `AppDataUpdate` proposals) and because the
+    /// dispatch path in `mls_sync` needs an explicit marker rather than
+    /// sniffing the extension-set shape.
+    #[doc(alias = "AppData migration")]
+    BootstrapMigration = 11,
 }
 
 impl std::fmt::Display for IntentKind {
@@ -61,6 +69,7 @@ impl std::fmt::Display for IntentKind {
             IntentKind::ProposeMemberUpdate => "ProposeMemberUpdate",
             IntentKind::ProposeGroupContextExtensions => "ProposeGroupContextExtensions",
             IntentKind::CommitPendingProposals => "CommitPendingProposals",
+            IntentKind::BootstrapMigration => "BootstrapMigration",
         };
         write!(f, "{}", description)
     }
@@ -83,7 +92,7 @@ pub enum IntentState {
 pub struct StoredGroupIntent {
     pub id: ID,
     pub kind: IntentKind,
-    pub group_id: group::ID,
+    pub group_id: GroupId,
     pub data: Vec<u8>,
     pub state: IntentState,
     pub payload_hash: Option<Vec<u8>>,
@@ -141,9 +150,8 @@ impl_fetch!(StoredGroupIntent, group_intents, ID);
 impl<C: ConnectionExt> Delete<StoredGroupIntent> for DbConnection<C> {
     type Key = ID;
     fn delete(&self, key: ID) -> Result<usize, StorageError> {
-        Ok(self.raw_query_write(|raw_conn| {
-            diesel::delete(dsl::group_intents.find(key)).execute(raw_conn)
-        })?)
+        Ok(self
+            .raw_query(|raw_conn| diesel::delete(dsl::group_intents.find(key)).execute(raw_conn))?)
     }
 }
 
@@ -155,7 +163,7 @@ impl<C: ConnectionExt> Delete<StoredGroupIntent> for DbConnection<C> {
 #[builder(setter(into), build_fn(error = "StorageError"))]
 pub struct NewGroupIntent {
     pub kind: IntentKind,
-    pub group_id: Vec<u8>,
+    pub group_id: GroupId,
     pub data: Vec<u8>,
     pub should_push: bool,
     #[builder(default = "IntentState::ToPublish")]
@@ -169,10 +177,15 @@ impl NewGroupIntent {
         NewGroupIntentBuilder::default()
     }
 
-    pub fn new(kind: IntentKind, group_id: Vec<u8>, data: Vec<u8>, should_push: bool) -> Self {
+    pub fn new(
+        kind: IntentKind,
+        group_id: impl Into<GroupId>,
+        data: Vec<u8>,
+        should_push: bool,
+    ) -> Self {
         Self {
             kind,
-            group_id,
+            group_id: group_id.into(),
             data,
             state: IntentState::ToPublish,
             should_push,
@@ -331,7 +344,7 @@ impl<C: ConnectionExt> QueryGroupIntent for DbConnection<C> {
         &self,
         to_save: NewGroupIntent,
     ) -> Result<StoredGroupIntent, crate::ConnectionError> {
-        self.raw_query_write(|conn| {
+        self.raw_query(|conn| {
             diesel::insert_into(dsl::group_intents)
                 .values(to_save)
                 .get_result(conn)
@@ -361,7 +374,7 @@ impl<C: ConnectionExt> QueryGroupIntent for DbConnection<C> {
 
         query = query.order(dsl::id.asc());
 
-        self.raw_query_read(|conn| query.load::<StoredGroupIntent>(conn))
+        self.raw_query(|conn| query.load::<StoredGroupIntent>(conn))
     }
 
     // Set the intent with the given ID to `Published` and set the payload hash. Optionally add
@@ -374,7 +387,7 @@ impl<C: ConnectionExt> QueryGroupIntent for DbConnection<C> {
         staged_commit: Option<Vec<u8>>,
         published_in_epoch: i64,
     ) -> Result<(), StorageError> {
-        let rows_changed = self.raw_query_write(|conn| {
+        let rows_changed = self.raw_query(|conn| {
             diesel::update(dsl::group_intents)
                 .filter(dsl::id.eq(intent_id))
                 // State machine requires that the only valid state transition to Published is from
@@ -391,7 +404,7 @@ impl<C: ConnectionExt> QueryGroupIntent for DbConnection<C> {
         })?;
 
         if rows_changed == 0 {
-            let already_published = self.raw_query_read(|conn| {
+            let already_published = self.raw_query(|conn| {
                 dsl::group_intents
                     .filter(dsl::id.eq(intent_id))
                     .first::<StoredGroupIntent>(conn)
@@ -412,7 +425,7 @@ impl<C: ConnectionExt> QueryGroupIntent for DbConnection<C> {
         intent_id: ID,
         cursor: Cursor,
     ) -> Result<(), StorageError> {
-        let rows_changed: usize = self.raw_query_write(|conn| {
+        let rows_changed: usize = self.raw_query(|conn| {
             diesel::update(dsl::group_intents)
                 .filter(dsl::id.eq(intent_id))
                 // State machine requires that the only valid state transition to Committed is from
@@ -436,7 +449,7 @@ impl<C: ConnectionExt> QueryGroupIntent for DbConnection<C> {
 
     // Set the intent with the given ID to `Committed`
     fn set_group_intent_processed(&self, intent_id: ID) -> Result<(), StorageError> {
-        let rows_changed = self.raw_query_write(|conn| {
+        let rows_changed = self.raw_query(|conn| {
             diesel::update(dsl::group_intents)
                 .filter(dsl::id.eq(intent_id))
                 .set(dsl::state.eq(IntentState::Processed))
@@ -454,7 +467,7 @@ impl<C: ConnectionExt> QueryGroupIntent for DbConnection<C> {
     // Set the intent with the given ID to `ToPublish`. Wipe any values for `payload_hash` and
     // `post_commit_data`
     fn set_group_intent_to_publish(&self, intent_id: ID) -> Result<(), StorageError> {
-        let rows_changed = self.raw_query_write(|conn| {
+        let rows_changed = self.raw_query(|conn| {
             diesel::update(dsl::group_intents)
                 .filter(dsl::id.eq(intent_id))
                 // State machine requires that the only valid state transition to ToPublish is from
@@ -480,7 +493,7 @@ impl<C: ConnectionExt> QueryGroupIntent for DbConnection<C> {
     /// Set the intent with the given ID to `Error`
     #[tracing::instrument(level = "trace", skip(self))]
     fn set_group_intent_error(&self, intent_id: ID) -> Result<(), StorageError> {
-        let rows_changed = self.raw_query_write(|conn| {
+        let rows_changed = self.raw_query(|conn| {
             diesel::update(dsl::group_intents)
                 .filter(dsl::id.eq(intent_id))
                 .set(dsl::state.eq(IntentState::Error))
@@ -505,7 +518,7 @@ impl<C: ConnectionExt> QueryGroupIntent for DbConnection<C> {
         &self,
         payload_hash: &[u8],
     ) -> Result<Option<StoredGroupIntent>, StorageError> {
-        let result = self.raw_query_read(|conn| {
+        let result = self.raw_query(|conn| {
             dsl::group_intents
                 .filter(dsl::payload_hash.eq(payload_hash))
                 .first::<StoredGroupIntent>(conn)
@@ -529,7 +542,7 @@ impl<C: ConnectionExt> QueryGroupIntent for DbConnection<C> {
             .map(|h| PayloadHashRef::from(h.as_ref()));
 
         // Query all dependencies in a single database call
-        let map: HashMap<PayloadHash, Vec<IntentDependency>> = self.raw_query_read(|conn| {
+        let map: HashMap<PayloadHash, Vec<IntentDependency>> = self.raw_query(|conn| {
             dsl::group_intents
                 .filter(dsl::payload_hash.eq_any(hashes))
                 .inner_join(
@@ -582,7 +595,7 @@ impl<C: ConnectionExt> QueryGroupIntent for DbConnection<C> {
     }
 
     fn increment_intent_publish_attempt_count(&self, intent_id: ID) -> Result<(), StorageError> {
-        self.raw_query_write(|conn| {
+        self.raw_query(|conn| {
             diesel::update(dsl::group_intents)
                 .filter(dsl::id.eq(intent_id))
                 .set(dsl::publish_attempts.eq(dsl::publish_attempts + 1))
@@ -631,7 +644,8 @@ where
             8 => Ok(IntentKind::ProposeMemberUpdate),
             9 => Ok(IntentKind::ProposeGroupContextExtensions),
             10 => Ok(IntentKind::CommitPendingProposals),
-            x => Err(format!("Unrecognized variant {}", x).into()),
+            11 => Ok(IntentKind::BootstrapMigration),
+            x => Err(format!("Unrecognized IntentKind variant {}", x).into()),
         }
     }
 }
@@ -695,7 +709,7 @@ pub(crate) mod tests {
         ) -> Self {
             Self {
                 kind,
-                group_id,
+                group_id: group_id.into(),
                 data,
                 state,
                 should_push: false,
@@ -705,9 +719,9 @@ pub(crate) mod tests {
 
     fn find_first_intent<C: ConnectionExt>(
         conn: &DbConnection<C>,
-        group_id: group::ID,
+        group_id: Vec<u8>,
     ) -> StoredGroupIntent {
-        conn.raw_query_read(|raw_conn| {
+        conn.raw_query(|raw_conn| {
             dsl::group_intents
                 .filter(dsl::group_id.eq(group_id))
                 .first(raw_conn)
@@ -737,7 +751,7 @@ pub(crate) mod tests {
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].kind, kind);
             assert_eq!(results[0].data, data);
-            assert_eq!(results[0].group_id, group_id);
+            assert_eq!(results[0].group_id.as_slice(), group_id.as_slice());
 
             let id = results[0].id;
 
@@ -1081,6 +1095,31 @@ pub(crate) mod tests {
             assert_eq!(dep2.cursor.sequence_id, 100);
             assert_eq!(dep2.cursor.originator_id, 42);
             assert_eq!(dep2.group_id.as_ref(), &group_id);
+        })
+    }
+
+    #[xmtp_common::test]
+    fn bootstrap_migration_intent_round_trips_through_sql() {
+        // Exercises both the i32 → IntentKind::BootstrapMigration arm
+        // and the Display impl. Cheap coverage for the new variant
+        // that would otherwise sit dead until end-to-end migration tests.
+        let group_id = rand_vec::<24>();
+        let data = rand_vec::<24>();
+        let kind = IntentKind::BootstrapMigration;
+        let to_insert =
+            NewGroupIntent::new_test(kind, group_id.clone(), data.clone(), IntentState::ToPublish);
+
+        with_connection(|conn| {
+            insert_group(conn, group_id.clone());
+            to_insert.store(conn).unwrap();
+
+            let results = conn
+                .find_group_intents(group_id.clone(), Some(vec![IntentState::ToPublish]), None)
+                .unwrap();
+
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].kind, IntentKind::BootstrapMigration);
+            assert_eq!(format!("{}", results[0].kind), "BootstrapMigration");
         })
     }
 }

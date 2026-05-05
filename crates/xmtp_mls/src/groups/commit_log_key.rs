@@ -15,6 +15,7 @@ use xmtp_db::{
 use xmtp_proto::xmtp::mls::api::v1::QueryCommitLogResponse;
 use xmtp_proto::xmtp::mls::message_contents::CommitLogEntry as CommitLogEntryProto;
 
+use xmtp_proto::types::GroupId;
 pub(crate) trait CommitLogKeyCrypto {
     type Error: std::error::Error;
     fn generate_commit_log_key(&self) -> Result<Secret, Self::Error>;
@@ -131,7 +132,7 @@ pub(crate) async fn derive_consensus_public_key(
             )
             .await?;
             context.db().set_group_commit_log_public_key(
-                &commit_log_response.group_id,
+                &GroupId::from(commit_log_response.group_id.as_slice()),
                 &signature.public_key,
             )?;
             return Ok(Some(signature.public_key.clone()));
@@ -338,7 +339,7 @@ mod tests {
         };
 
         let response = xmtp_proto::xmtp::mls::api::v1::QueryCommitLogResponse {
-            group_id: group.group_id.clone(),
+            group_id: group.group_id.to_vec(),
             commit_log_entries: vec![first_entry, second_entry],
             paging_info: None,
         };
@@ -397,7 +398,7 @@ mod tests {
         };
 
         let response = xmtp_proto::xmtp::mls::api::v1::QueryCommitLogResponse {
-            group_id: group.group_id.clone(),
+            group_id: group.group_id.to_vec(),
             commit_log_entries: vec![unsigned_entry, valid_entry],
             paging_info: None,
         };
@@ -465,7 +466,7 @@ mod tests {
         };
 
         let response = xmtp_proto::xmtp::mls::api::v1::QueryCommitLogResponse {
-            group_id: group.group_id.clone(),
+            group_id: group.group_id.to_vec(),
             commit_log_entries: vec![invalid_entry, valid_entry],
             paging_info: None,
         };
