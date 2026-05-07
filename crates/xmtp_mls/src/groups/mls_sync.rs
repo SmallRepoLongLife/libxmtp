@@ -320,13 +320,13 @@ impl RetryableError for IntentResolutionError {
 
 #[derive(Debug)]
 pub(crate) struct PublishIntentData {
-    staged_commit: Option<Vec<u8>>,
-    post_commit_action: Option<Vec<u8>>,
+    pub(crate) staged_commit: Option<Vec<u8>>,
+    pub(crate) post_commit_action: Option<Vec<u8>>,
     /// One or more payloads to publish. Most intents have a single payload (commit or message),
     /// but proposal intents may have multiple payloads (one per proposal).
-    payloads_to_publish: Vec<Vec<u8>>,
-    should_send_push_notification: bool,
-    group_epoch: u64,
+    pub(crate) payloads_to_publish: Vec<Vec<u8>>,
+    pub(crate) should_send_push_notification: bool,
+    pub(crate) group_epoch: u64,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -2690,20 +2690,17 @@ where
             IntentKind::MetadataUpdate => {
                 let metadata_intent = UpdateMetadataIntentData::try_from(intent.data.clone())?;
 
-                // Gate the AppDataUpdate path on both the capability flag
-                // AND a non-empty component registry. The registry check
-                // keeps unmigrated groups on the legacy path so a sender
-                // doesn't publish commits that the receiver would deny
-                // (`NoRegistryEntry`) against an empty registry.
+                // Gate the AppDataUpdate path on the capability flag
+                // AND a non-empty component registry. The registry
+                // check keeps unmigrated groups on the legacy path so
+                // a sender doesn't publish commits the receiver would
+                // deny against an empty registry. `load_component_registry`
+                // also consults `TEST_REGISTRY_OVERRIDE`, so tests that
+                // install a fake registry exercise this branch even
+                // before a real bootstrap commit lands.
                 let proposals_on = self.proposals_enabled(openmls_group);
                 let registry_populated =
                     !super::app_data::load_component_registry(openmls_group)?.is_empty();
-                // DEBUG-level routing trace so operators can see which
-                // groups are on which path during the rollout — especially
-                // useful if the migration ships only partially and we need
-                // to know how many groups are still on the legacy path.
-                // INFO would spam every metadata update; DEBUG keeps it
-                // opt-in for on-demand investigation.
                 tracing::debug!(
                     group_id = hex::encode(self.group_id.as_slice()),
                     proposals_enabled = proposals_on,
@@ -2800,12 +2797,43 @@ where
                 }))
             }
             IntentKind::UpdateAdminList => {
-                // ADMIN_LIST stays on the legacy GCE path: routing it
-                // through AppDataUpdate would let the GMM-backed validators
-                // in `validated_commit.rs` diverge from the dict until the
-                // migration is dual-write or complete.
                 let admin_list_update_intent =
                     UpdateAdminListIntentData::try_from(intent.data.clone())?;
+
+                // Mirror the MetadataUpdate dual-routing gate: only
+                // route through AppDataUpdate on groups whose AppData
+                // dict has the `COMPONENT_REGISTRY` entry (the
+                // bootstrap-commit marker). Otherwise stay on the
+                // legacy GCE path so unmigrated peers continue to
+                // validate via the legacy `GroupMutableMetadata`
+                // extension. Single shared predicate via
+                // `is_migrated_group` keeps every send/receive/validate
+                // path honest about what "migrated" means.
+                let is_migrated = super::app_data::is_migrated_group(openmls_group);
+                tracing::debug!(
+                    group_id = hex::encode(self.group_id.as_slice()),
+                    is_migrated,
+                    path = if is_migrated {
+                        "app_data_update"
+                    } else {
+                        "legacy_gce"
+                    },
+                    "UpdateAdminList intent routing"
+                );
+                if is_migrated {
+                    let signer = self.context.identity().installation_keys.clone();
+                    let publish =
+                        super::app_data::sender_intents::apply_update_admin_list_app_data_intent(
+                            &self.context,
+                            openmls_group,
+                            admin_list_update_intent,
+                            signer,
+                            intent.should_push,
+                        )?;
+                    return Ok(Some(publish));
+                }
+
+                // Legacy GCE path on unmigrated groups.
                 let mutable_metadata_extensions = build_extensions_for_admin_lists_update(
                     openmls_group,
                     admin_list_update_intent,
@@ -2834,6 +2862,35 @@ where
             IntentKind::UpdatePermission => {
                 let update_permissions_intent =
                     UpdatePermissionIntentData::try_from(intent.data.clone())?;
+
+                // Mirror the MetadataUpdate / UpdateAdminList dual-
+                // routing gate via the shared `is_migrated_group`
+                // predicate.
+                let is_migrated = super::app_data::is_migrated_group(openmls_group);
+                tracing::debug!(
+                    group_id = hex::encode(self.group_id.as_slice()),
+                    is_migrated,
+                    path = if is_migrated {
+                        "app_data_update"
+                    } else {
+                        "legacy_gce"
+                    },
+                    "UpdatePermission intent routing"
+                );
+                if is_migrated {
+                    let signer = self.context.identity().installation_keys.clone();
+                    let publish =
+                        super::app_data::sender_intents::apply_update_permission_app_data_intent(
+                            &self.context,
+                            openmls_group,
+                            update_permissions_intent,
+                            signer,
+                            intent.should_push,
+                        )?;
+                    return Ok(Some(publish));
+                }
+
+                // Legacy GCE path on unmigrated groups.
                 let group_permissions_extensions = build_extensions_for_permissions_update(
                     openmls_group,
                     update_permissions_intent,
@@ -2867,6 +2924,19 @@ where
             IntentKind::ProposeMemberUpdate => {
                 if !self.proposals_enabled(openmls_group) {
                     return Err(GroupError::from(CommitValidationError::ProposalsNotEnabled));
+                }
+
+                // Defensive gate. The proposal-by-reference flow
+                // emits Add/Remove + GCE proposals updating the
+                // legacy GROUP_MEMBERSHIP_EXTENSION_ID extension. On
+                // migrated groups that extension is gone, so the
+                // GCE would re-add it and break the dict-as-source-
+                // of-truth invariant. Bail out the same way Task 7c
+                // (`apply_update_group_membership_intent`) does, via
+                // the same canonical `is_migrated_extensions`
+                // predicate.
+                if super::app_data::is_migrated_extensions(openmls_group.extensions()) {
+                    return Err(GroupError::UpdateGroupMembershipMigratedNotImplemented);
                 }
 
                 let intent_data = ProposeMemberUpdateIntentData::try_from(intent.data.as_slice())?;
